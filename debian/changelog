@@ -5,6 +5,7 @@ python-schemathesis (3.19.7-0pexip1) pexip; urgency=medium
     is older than the version that swiched to httpx).
   * Add patch to remove GraphQL support.
   * Add patch to remove JUnit XML support.
+  * tests: add patch to fix imports.
 
  -- Huw Jones <huw@pexip.com>  Tue, 19 Sep 2023 15:19:56 +0100
 

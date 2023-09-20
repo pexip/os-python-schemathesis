@@ -1,0 +1,24 @@
+--- a/test/test_yaml.py
++++ b/test/test_yaml.py
+@@ -1,7 +1,7 @@
+ import pytest
+ import yaml
+ 
+-from src.schemathesis.utils import StringDatesYAMLLoader
++from schemathesis.utils import StringDatesYAMLLoader
+ 
+ 
+ @pytest.mark.parametrize(
+--- a/test/specs/openapi/test_stateful.py
++++ b/test/specs/openapi/test_stateful.py
+@@ -5,8 +5,8 @@
+ from schemathesis.exceptions import CheckFailed
+ from schemathesis.specs.openapi.stateful.links import make_response_filter, match_status_code
+ from schemathesis.stateful import StepResult
+-from src.schemathesis.models import CaseSource, Check, Status
+-from src.schemathesis.runner.serialization import SerializedCheck
++from schemathesis.models import CaseSource, Check, Status
++from schemathesis.runner.serialization import SerializedCheck
+ 
+ 
+ @pytest.mark.parametrize(
