@@ -1,0 +1,454 @@
+--- a/src/schemathesis/__init__.py
++++ b/src/schemathesis/__init__.py
+@@ -4,7 +4,7 @@
+ 
+ del _install_hypothesis_jsonschema_compatibility_shim
+ 
+-from . import auths, checks, contrib, fixups, graphql, hooks, runner, serializers, targets  # noqa: E402
++from . import auths, checks, contrib, fixups, hooks, runner, serializers, targets  # noqa: E402
+ from .constants import DataGenerationMethod, __version__  # noqa: E402
+ from .models import Case  # noqa: E402
+ from .specs import openapi  # noqa: E402
+--- a/src/schemathesis/cli/__init__.py
++++ b/src/schemathesis/cli/__init__.py
+@@ -38,8 +38,6 @@
+ from ..models import Case, CheckFunction
+ from ..runner import events, prepare_hypothesis_settings
+ from ..schemas import BaseSchema
+-from ..specs.graphql import loaders as gql_loaders
+-from ..specs.graphql.schemas import GraphQLSchema
+ from ..specs.openapi import loaders as oas_loaders
+ from ..stateful import Stateful
+ from ..targets import Target
+@@ -952,13 +950,7 @@
+     """Automatically load API schema."""
+     first: Callable[[LoaderConfig], BaseSchema]
+     second: Callable[[LoaderConfig], BaseSchema]
+-    if is_probably_graphql(config.schema_location):
+-        # Try GraphQL first, then fallback to Open API
+-        first, second = (_load_graphql_schema, _load_openapi_schema)
+-    else:
+-        # Try Open API first, then fallback to GraphQL
+-        first, second = (_load_openapi_schema, _load_graphql_schema)
+-    return _try_load_schema(config, first, second)
++    return _load_openapi_schema(config)
+ 
+ 
+ def _try_load_schema(
+@@ -974,12 +966,6 @@
+             raise exc from None
+ 
+ 
+-def _load_graphql_schema(config: LoaderConfig) -> GraphQLSchema:
+-    loader = detect_loader(config.schema_location, config.app, is_openapi=False)
+-    kwargs = get_graphql_loader_kwargs(loader, config)
+-    return loader(config.schema_location, **kwargs)
+-
+-
+ def _load_openapi_schema(config: LoaderConfig) -> BaseSchema:
+     loader = detect_loader(config.schema_location, config.app, is_openapi=True)
+     kwargs = get_loader_kwargs(loader, config)
+@@ -991,12 +977,12 @@
+     if file_exists(schema_location):
+         # If there is an existing file with the given name,
+         # then it is likely that the user wants to load API schema from there
+-        return oas_loaders.from_path if is_openapi else gql_loaders.from_path  # type: ignore
++        return oas_loaders.from_path  # type: ignore
+     if app is not None and not urlparse(schema_location).netloc:
+         # App is passed & location is relative
+-        return oas_loaders.get_loader_for_app(app) if is_openapi else gql_loaders.get_loader_for_app(app)
++        return oas_loaders.get_loader_for_app(app)
+     # Default behavior
+-    return oas_loaders.from_uri if is_openapi else gql_loaders.from_url  # type: ignore
++    return oas_loaders.from_uri  # type: ignore
+ 
+ 
+ def get_loader_kwargs(loader: Callable, config: LoaderConfig) -> Dict[str, Any]:
+--- a/src/schemathesis/runner/__init__.py
++++ b/src/schemathesis/runner/__init__.py
+@@ -15,7 +15,6 @@
+ )
+ from ..models import CheckFunction
+ from ..schemas import BaseSchema
+-from ..specs.graphql import loaders as gql_loaders
+ from ..specs.openapi import loaders as oas_loaders
+ from ..stateful import Stateful
+ from ..targets import DEFAULT_TARGETS, Target
+@@ -143,16 +142,13 @@
+         oas_loaders.from_path,
+         oas_loaders.from_asgi,
+         oas_loaders.from_wsgi,
+-        gql_loaders.from_dict,
+-        gql_loaders.from_url,
+-        gql_loaders.from_wsgi,
+     ):
+         # Custom loaders are not checked
+         return
+     if isinstance(schema_uri, dict):
+-        if loader not in (oas_loaders.from_dict, gql_loaders.from_dict):
++        if loader not in (oas_loaders.from_dict,):
+             raise ValueError("Dictionary as a schema is allowed only with `from_dict` loader")
+-    elif loader in (oas_loaders.from_dict, gql_loaders.from_dict):
++    elif loader in (oas_loaders.from_dict,):
+         raise ValueError("Schema should be a dictionary for `from_dict` loader")
+ 
+ 
+--- a/test/conftest.py
++++ b/test/conftest.py
+@@ -23,7 +23,6 @@
+ from schemathesis.specs.openapi import loaders as oas_loaders
+ from schemathesis.utils import WSGIResponse
+ 
+-from .apps import _graphql as graphql
+ from .apps import openapi
+ from .apps.openapi.schema import OpenAPIVersion, Operation
+ from .utils import get_schema_path, make_schema
+@@ -205,37 +204,6 @@
+     return oas_loaders.from_uri(openapi3_schema_url)
+ 
+ 
+-@pytest.fixture
+-def graphql_path():
+-    return "/graphql"
+-
+-
+-@pytest.fixture
+-def graphql_app(graphql_path):
+-    return graphql._flask.create_app(graphql_path)
+-
+-
+-@pytest.fixture()
+-def graphql_server(graphql_app):
+-    port = run_flask_server(graphql_app)
+-    yield {"port": port}
+-
+-
+-@pytest.fixture()
+-def graphql_url(graphql_server, graphql_path):
+-    return f"http://127.0.0.1:{graphql_server['port']}{graphql_path}"
+-
+-
+-@pytest.fixture()
+-def graphql_schema(graphql_url):
+-    return schemathesis.graphql.from_url(graphql_url)
+-
+-
+-@pytest.fixture
+-def graphql_strategy(graphql_schema):
+-    return graphql_schema["/graphql"]["POST"].as_strategy()
+-
+-
+ @pytest.fixture(scope="session")
+ def cli():
+     """CLI runner helper.
+@@ -657,11 +625,6 @@
+     return asgi_app_factory()
+ 
+ 
+-@pytest.fixture()
+-def fastapi_graphql_app(graphql_path):
+-    return graphql._fastapi.create_app(graphql_path)
+-
+-
+ @pytest.fixture
+ def real_app_schema(schema_url):
+     return oas_loaders.from_uri(schema_url)
+@@ -705,18 +668,6 @@
+         """
+     )
+     return f"{module.purebasename}:app"
+-
+-
+-@pytest.fixture
+-def loadable_graphql_fastapi_app(testdir, graphql_path):
+-    module = testdir.make_importable_pyfile(
+-        location=f"""
+-        from test.apps._graphql._fastapi import create_app
+-
+-        app = create_app('{graphql_path}')
+-        """
+-    )
+-    return f"{module.purebasename}:app"
+ 
+ 
+ @pytest.fixture
+--- a/test/apps/__init__.py
++++ b/test/apps/__init__.py
+@@ -7,13 +7,12 @@
+ from schemathesis.cli import CsvEnumChoice
+ 
+ try:
+-    from . import _graphql, openapi
++    from . import openapi
+ except ImportError as exc:
+     # try/except for cases when there is a different ImportError in the block before, that
+     # doesn't imply another running environment (test_server.sh vs usual pytest run)
+     # Ref: https://github.com/schemathesis/schemathesis/issues/658
+     try:
+-        import _graphql
+         import openapi
+     except ImportError:
+         raise exc from None
+@@ -26,7 +25,7 @@
+ @click.command()
+ @click.argument("port", type=int)
+ @click.option("--operations", type=AvailableOperations)
+-@click.option("--spec", type=click.Choice(["openapi2", "openapi3", "graphql"]), default="openapi2")
++@click.option("--spec", type=click.Choice(["openapi2", "openapi3"]), default="openapi2")
+ @click.option("--framework", type=click.Choice(["aiohttp", "flask"]), default="aiohttp")
+ def run_app(port: int, operations: List[openapi.schema.Operation], spec: str, framework: str) -> None:
+     if spec == "graphql":
+--- a/test/test_rate_limit.py
++++ b/test/test_rate_limit.py
+@@ -3,13 +3,11 @@
+ import pytest
+ from pyrate_limiter import BucketFullException, RequestRate
+ 
+-import schemathesis.graphql
+-
++import schemathesis
+ 
+ @pytest.mark.parametrize(
+     "loader, fixture",
+     (
+-        (schemathesis.graphql.from_url, "graphql_url"),
+         (schemathesis.openapi.from_uri, "openapi3_schema_url"),
+     ),
+ )
+--- a/test/cli/test_commands.py
++++ b/test/cli/test_commands.py
+@@ -3,7 +3,6 @@
+ import pathlib
+ import sys
+ import time
+-from test.apps._graphql._flask import create_app as create_graphql_app
+ from test.apps.openapi._flask import create_app as create_openapi_app
+ from test.utils import HERE, SIMPLE_PATH, strip_style_win32
+ from unittest.mock import ANY
+@@ -2041,6 +2040,7 @@
+     assert "[1m" not in result.stdout
+ 
+ 
++@pytest.mark.skip("GraphQL support removed")
+ @pytest.mark.parametrize("graphql_path", ("/graphql", "/foo"))
+ def test_graphql_url(cli, graphql_url, graphql_path):
+     # When the target API is GraphQL
+@@ -2048,6 +2048,7 @@
+     assert_graphql(result)
+ 
+ 
++@pytest.mark.skip("GraphQL support removed")
+ def test_graphql_asgi(cli, loadable_graphql_fastapi_app, graphql_path):
+     # When the target API is GraphQL
+     result = cli.run(f"--app={loadable_graphql_fastapi_app}", "--hypothesis-max-examples=5", graphql_path)
+@@ -2265,10 +2266,6 @@
+                 "schema.yaml",
+                 lambda: create_openapi_app(operations=("success",)),
+             ),
+-            (
+-                "graphql",
+-                create_graphql_app,
+-            ),
+         )
+     ),
+ )
+--- a/test/loaders/test_common.py
++++ b/test/loaders/test_common.py
+@@ -18,8 +18,6 @@
+     (
+         schemathesis.openapi.from_asgi,
+         schemathesis.openapi.from_wsgi,
+-        schemathesis.graphql.from_asgi,
+-        schemathesis.graphql.from_wsgi,
+     ),
+ )
+ def test_absolute_urls_for_apps(loader):
+@@ -30,7 +28,7 @@
+ 
+ 
+ @pytest.mark.parametrize(
+-    "loader", (schemathesis.openapi.from_dict, schemathesis.openapi.from_pytest_fixture, schemathesis.graphql.from_dict)
++    "loader", (schemathesis.openapi.from_dict, schemathesis.openapi.from_pytest_fixture)
+ )
+ def test_invalid_code_sample_style(loader):
+     with pytest.raises(ValueError, match="Invalid value for code sample style: ruby. Available styles: python, curl"):
+@@ -47,7 +45,6 @@
+     (
+         (schemathesis.openapi.from_uri, "openapi3_schema_url", "http://127.0.0.1:8081/schema.yaml"),
+         (schemathesis.openapi.from_uri, "default_schema_url", "http://127.0.0.1:8081/schema.yaml"),
+-        (schemathesis.graphql.from_url, "graphql_url", "http://127.0.0.1:8081/graphql"),
+     ),
+ )
+ def test_port_override(request, loader, url_fixture, expected):
+@@ -74,12 +71,6 @@
+             "schemathesis.specs.openapi.loaders.requests.get",
+             "http://[2002:7f00:1::]:8081/schema.yaml",
+         ),
+-        (
+-            schemathesis.graphql.from_url,
+-            "graphql_url",
+-            "schemathesis.specs.graphql.loaders.requests.post",
+-            "http://[2002:7f00:1::]:8081/graphql",
+-        ),
+     ),
+ )
+ def test_port_override_with_ipv6(request, loader, url_fixture, target, mocker, expected):
+@@ -100,7 +91,6 @@
+     "loader, url_fixture",
+     (
+         (schemathesis.openapi.from_uri, "openapi3_schema_url"),
+-        (schemathesis.graphql.from_url, "graphql_url"),
+     ),
+ )
+ @pytest.mark.parametrize("base_url", ("http://example.com/", "http://example.com"))
+@@ -117,7 +107,6 @@
+     "target, loader",
+     (
+         ("schemathesis.specs.openapi.loaders.requests.get", schemathesis.openapi.from_uri),
+-        ("schemathesis.specs.graphql.loaders.requests.post", schemathesis.graphql.from_url),
+     ),
+ )
+ def test_uri_loader_custom_kwargs(mocker, target, loader):
+@@ -186,11 +175,9 @@
+     (
+         (schemathesis.openapi.from_uri, {}, FROM_DICT_ERROR_MESSAGE),
+         (schemathesis.openapi.from_dict, "", "Schema should be a dictionary for `from_dict` loader"),
+-        (schemathesis.graphql.from_dict, "", "Schema should be a dictionary for `from_dict` loader"),
+         (schemathesis.openapi.from_wsgi, {}, FROM_DICT_ERROR_MESSAGE),
+         (schemathesis.openapi.from_file, {}, FROM_DICT_ERROR_MESSAGE),
+         (schemathesis.openapi.from_path, {}, FROM_DICT_ERROR_MESSAGE),
+-        (schemathesis.graphql.from_wsgi, {}, FROM_DICT_ERROR_MESSAGE),
+     ),
+ )
+ @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+--- a/test/loaders/test_graphql.py
++++ b/test/loaders/test_graphql.py
+@@ -3,7 +3,8 @@
+ 
+ import pytest
+ 
+-from schemathesis.specs.graphql import loaders
++pytestmark = pytest.mark.skip("GraphQL support removed")
++
+ 
+ RAW_SCHEMA = """
+ type Book {
+--- a/test/specs/graphql/test_basic.py
++++ b/test/specs/graphql/test_basic.py
+@@ -7,8 +7,8 @@
+ 
+ import schemathesis
+ from schemathesis.constants import SCHEMATHESIS_TEST_CASE_HEADER, USER_AGENT
+-from schemathesis.specs.graphql.loaders import INTROSPECTION_QUERY
+-from schemathesis.specs.graphql.schemas import GraphQLCase
++
++pytestmark = pytest.mark.skip("GraphQL support removed")
+ 
+ 
+ def test_raw_schema(graphql_schema):
+--- a/test/specs/graphql/test_custom_scalars.py
++++ b/test/specs/graphql/test_custom_scalars.py
+@@ -4,8 +4,8 @@
+ 
+ import schemathesis
+ from schemathesis.exceptions import UsageError
+-from schemathesis.graphql import nodes
+-from schemathesis.specs.graphql.scalars import CUSTOM_SCALARS
++
++pytestmark = pytest.mark.skip("GraphQL support removed")
+ 
+ 
+ @pytest.fixture(autouse=True)
+@@ -38,7 +38,6 @@
+ @pytest.mark.parametrize(
+     "name, value, expected",
+     (
+-        (42, st.just("foo").map(nodes.String), "Scalar name 42 must be a string"),
+         ("Date", 42, "42 must be a Hypothesis strategy which generates AST nodes matching this scalar"),
+     ),
+ )
+--- a/test/runner/test_runner.py
++++ b/test/runner/test_runner.py
+@@ -28,7 +28,6 @@
+ from schemathesis.runner import ThreadPoolRunner, events, from_schema, get_requests_auth
+ from schemathesis.runner.impl import threadpool
+ from schemathesis.runner.impl.core import get_wsgi_auth, has_too_many_responses_with_status, reraise
+-from schemathesis.specs.graphql import loaders as gql_loaders
+ from schemathesis.specs.openapi import loaders as oas_loaders
+ 
+ 
+@@ -895,6 +894,7 @@
+     assert not finished.has_errors
+ 
+ 
++@pytest.mark.skip("GraphQL support removed")
+ def test_graphql(graphql_url):
+     schema = gql_loaders.from_url(graphql_url)
+     initialized, *other, finished = list(
+--- a/test/cli/test_targeted.py
++++ b/test/cli/test_targeted.py
+@@ -27,6 +27,7 @@
+     assert "  -t, --target [response_time|all]" in lines
+ 
+ 
++@pytest.mark.skip("GraphQL support removed")
+ @pytest.mark.usefixtures("new_target")
+ @pytest.mark.operations("success")
+ def test_custom_target(cli, new_target, openapi3_schema_url):
+@@ -39,6 +40,7 @@
+     assert "NEW TARGET IS CALLED" in result.stdout
+ 
+ 
++@pytest.mark.skip("GraphQL support removed")
+ @pytest.mark.usefixtures("new_target")
+ @pytest.mark.operations("success")
+ def test_custom_target_graphql(cli, new_target, graphql_url):
+--- a/test/code_samples/test_python.py
++++ b/test/code_samples/test_python.py
+@@ -101,6 +101,7 @@
+     eval(f"'{escaped}'")
+ 
+ 
++@pytest.mark.skip("GraphQL support removed")
+ @pytest.mark.filterwarnings("ignore:.*method is good for exploring strategies.*")
+ def test_graphql_code_sample(graphql_url, graphql_schema, graphql_strategy):
+     case = graphql_strategy.example()
+--- a/test/auth/test_pytest.py
++++ b/test/auth/test_pytest.py
+@@ -5,7 +5,7 @@
+ AUTH_CLASS_NAME = "TokenAuth"
+ 
+ 
+-@pytest.fixture(params=["openapi", "graphql"])
++@pytest.fixture(params=["openapi"])
+ def schema_definition(request):
+     if request.param == "openapi":
+         # No-op, as it is already defined
+--- a/test/specs/graphql/test_pytest.py
++++ b/test/specs/graphql/test_pytest.py
+@@ -1,3 +1,7 @@
++import pytest
++
++pytestmark = pytest.mark.skip("GraphQL support removed")
++
+ def test_basic_pytest_graphql(testdir, graphql_path, graphql_url):
+     testdir.make_test(
+         f"""
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -37,7 +37,6 @@
+     "curlify>=2.2.1,<3.0",
+     "httpx>=0.22.0,<1.0",
+     "hypothesis>=6.31.6,<7",
+-    "hypothesis_graphql>=0.9.0,<1",
+     "hypothesis_jsonschema>=0.22.1,<1",
+     "importlib_metadata>=1.1,!=3.8,<5; python_version<'3.8'",
+     "jsonschema>=4.3.2,<5.0",
+@@ -65,7 +64,6 @@
+     "pytest-httpserver>=1.0,<2.0",
+     "pytest-mock>=3.7.0,<4.0",
+     "pytest-xdist>=3,<4.0",
+-    "strawberry-graphql[fastapi]>=0.109.0",
+     "trustme>=0.9.0,<1.0"
+ ]
+ cov = [
