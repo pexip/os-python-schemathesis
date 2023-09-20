@@ -1,5 +1,7 @@
 python-schemathesis (3.19.7-0pexip1) pexip; urgency=medium
 
   * Prepare Pexip Packaging
+  * Add patch to use packaged starlette testclient (as our version of starlette
+    is older than the version that swiched to httpx).
 
  -- Huw Jones <huw@pexip.com>  Tue, 19 Sep 2023 15:19:56 +0100
