@@ -1,0 +1,59 @@
+--- a/test/cli/test_junitxml.py
++++ b/test/cli/test_junitxml.py
+@@ -3,6 +3,8 @@
+ import pytest
+ from _pytest.main import ExitCode
+ 
++pytestmark = pytest.mark.skip("JUnitXML support removed")
++
+ 
+ @pytest.mark.operations("success")
+ def test_junitxml_option(cli, schema_url, hypothesis_max_examples, tmp_path):
+--- a/test/cli/output/test_default.py
++++ b/test/cli/output/test_default.py
+@@ -177,6 +177,7 @@
+     )
+ 
+ 
++@pytest.mark.skip("JUnitXML support removed")
+ def test_display_statistic_junitxml(capsys, execution_context, results_set):
+     xml_path = "/tmp/junit.xml"
+     execution_context.junit_xml_file = xml_path
+--- a/src/schemathesis/cli/__init__.py
++++ b/src/schemathesis/cli/__init__.py
+@@ -48,7 +48,6 @@
+ from .context import ExecutionContext, FileReportContext, ServiceReportContext
+ from .debug import DebugOutputHandler
+ from .handlers import EventHandler
+-from .junitxml import JunitXMLHandler
+ from .options import CsvChoice, CsvEnumChoice, CustomHelpMessageChoice, NotSet, OptionalInt
+ 
+ try:
+@@ -1132,8 +1131,6 @@
+                 telemetry=telemetry,
+             )
+         )
+-    if junit_xml is not None:
+-        handlers.append(JunitXMLHandler(junit_xml))
+     if debug_output_file is not None:
+         handlers.append(DebugOutputHandler(debug_output_file))
+     if cassette_path is not None:
+@@ -1149,7 +1146,7 @@
+         show_errors_tracebacks=show_errors_tracebacks,
+         validate_schema=validate_schema,
+         cassette_path=cassette_path.name if cassette_path is not None else None,
+-        junit_xml_file=junit_xml.name if junit_xml is not None else None,
++        junit_xml_file=None,
+         verbosity=verbosity,
+         code_sample_style=code_sample_style,
+         report=report_context,
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -40,7 +40,6 @@
+     "hypothesis_jsonschema>=0.22.1,<1",
+     "importlib_metadata>=1.1,!=3.8,<5; python_version<'3.8'",
+     "jsonschema>=4.3.2,<5.0",
+-    "junit-xml>=1.9,<2.0",
+     "pyrate-limiter>=2.10,<3.0",
+     "pytest-subtests>=0.2.1,<0.8.0",
+     "pytest>=4.6.4,<8",
