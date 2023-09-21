@@ -9,3 +9,6 @@ export PYBUILD_TEST_ARGS=-v --numprocesses=auto {build_dir}/test
 
 %:
 	dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_auto_test:
+	no_proxy="localhost,127.0.0.1" dh_auto_test
