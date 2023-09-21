@@ -3,3 +3,4 @@ remove-graphql.patch
 remove-junit-xml.patch
 fix-test-imports.patch
 tests-skip-cli-entrypoints.patch
+flask-1.x.patch

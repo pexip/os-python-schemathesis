@@ -5,7 +5,9 @@ python-schemathesis (3.19.7-0pexip1) pexip; urgency=medium
     is older than the version that swiched to httpx).
   * Add patch to remove GraphQL support.
   * Add patch to remove JUnit XML support.
-  * tests: add patch to fix imports.
+  * tests: add patches to fix:
+    - imports
+    - flask 1.x compatibility
   * tests: fix client requests made to 127.0.0.1 from being blocking by
     pybuild's proxy settings
   * tests: skip CLI entrypoint tests (the entrypoint would have been installed

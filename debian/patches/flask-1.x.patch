@@ -1,0 +1,63 @@
+--- a/test/runner/test_runner.py
++++ b/test/runner/test_runner.py
+@@ -145,8 +145,7 @@
+     if isinstance(any_app_schema.app, Flask):
+         assert failure.response.headers == {
+             "Content-Type": ["text/html; charset=utf-8"],
+-            "Content-Length": ["265"],
+-            "ETag": ANY,
++            "Content-Length": ["290"],
+         }
+     else:
+         assert failure.response.headers["Content-Type"] == ["text/plain; charset=utf-8"]
+@@ -174,7 +173,7 @@
+     assert json.loads(base64.b64decode(success.response.body)) == {"success": True}
+     assert success.response.encoding == "utf-8"
+     if isinstance(any_app_schema.app, Flask):
+-        assert success.response.headers == {"Content-Type": ["application/json"], "Content-Length": ["17"], "ETag": ANY}
++        assert success.response.headers == {"Content-Type": ["application/json"], "Content-Length": ["17"]}
+     else:
+         assert success.response.headers["Content-Type"] == ["application/json; charset=utf-8"]
+ 
+--- a/test/auth/test_pytest.py
++++ b/test/auth/test_pytest.py
+@@ -85,14 +85,19 @@
+     if python_app_type == "wsgi":
+         return """
+ import werkzeug
++from werkzeug.wrappers import Response as _Response
++from werkzeug.wrappers.json import JSONMixin
++
++class Response(JSONMixin, _Response):
++    pass
+ 
+ @schema.auth()
+ class Auth:
+ 
+     def get(self, context):
+-        client = werkzeug.Client(context.app)
++        client = werkzeug.Client(context.app, Response)
+         response = client.post("/auth/token/", json={"username": "test", "password": "pass"})
+-        return response.json["access_token"]
++        return response.get_json()["access_token"]
+ 
+     def set(self, case, data, context):
+         case.headers = case.headers or {}
+--- a/test/cli/test_commands.py
++++ b/test/cli/test_commands.py
+@@ -1505,12 +1505,12 @@
+     result = cli.run("/schema.yaml", "--app", f"{module.purebasename}:app", "--hypothesis-derandomize")
+     assert result.exit_code == ExitCode.TESTS_FAILED, result.stdout
+     lines = result.stdout.strip().split("\n")
+-    assert "== APPLICATION LOGS ==" in lines[41], result.stdout.strip()
+-    assert "ERROR in app: Exception on /api/success [GET]" in lines[43]
++    assert "== APPLICATION LOGS ==" in lines[39], result.stdout.strip()
++    assert "ERROR in app: Exception on /api/success [GET]" in lines[41]
+     if sys.version_info >= (3, 11):
+         assert lines[59] == "ZeroDivisionError: division by zero"
+     else:
+-        assert lines[54] == '    raise ZeroDivisionError("division by zero")'
++        assert lines[56] == '    raise ZeroDivisionError("division by zero")'
+ 
+ 
+ @pytest.mark.parametrize("args", ((), ("--base-url",)))
