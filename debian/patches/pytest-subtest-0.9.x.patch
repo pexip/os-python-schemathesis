@@ -1,0 +1,18 @@
+--- a/test/test_lazy.py
++++ b/test/test_lazy.py
+@@ -575,14 +575,8 @@
+     reports = [
+         report
+         for report in terminalreporter.stats["passed"]
+-        if hasattr(report, "context")
+     ]
+-    unique = {
+-        tuple(report.context.kwargs.items())
+-        for report in reports
+-    }
+-    # SubTest reports should contain unique kwargs
+-    assert len(unique) == len(reports) == 1
++    assert len(reports) == 1
+     yield
+ """
+     )

@@ -4,3 +4,4 @@ remove-junit-xml.patch
 fix-test-imports.patch
 tests-skip-cli-entrypoints.patch
 flask-1.x.patch
+pytest-subtest-0.9.x.patch
