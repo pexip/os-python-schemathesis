@@ -1,15 +1,15 @@
-Index: os-python-schemathesis/starlette_testclient/__init__.py
+Index: os-python-schemathesis/src/schemathesis/starlette_testclient/__init__.py
 ===================================================================
 --- /dev/null
-+++ os-python-schemathesis/starlette_testclient/__init__.py
++++ os-python-schemathesis/src/schemathesis/starlette_testclient/__init__.py
 @@ -0,0 +1,3 @@
-+from starlette_testclient._testclient import TestClient
++from schemathesis.starlette_testclient._testclient import TestClient
 +
 +__all__ = ["TestClient"]
-Index: os-python-schemathesis/starlette_testclient/_testclient.py
+Index: os-python-schemathesis/src/schemathesis/starlette_testclient/_testclient.py
 ===================================================================
 --- /dev/null
-+++ os-python-schemathesis/starlette_testclient/_testclient.py
++++ os-python-schemathesis/src/schemathesis/starlette_testclient/_testclient.py
 @@ -0,0 +1,581 @@
 +import contextlib
 +import http
@@ -592,3 +592,55 @@ Index: os-python-schemathesis/starlette_testclient/_testclient.py
 +            )
 +            if message["type"] == "lifespan.shutdown.failed":
 +                await receive()
+Index: os-python-schemathesis/src/schemathesis/models.py
+===================================================================
+--- os-python-schemathesis.orig/src/schemathesis/models.py
++++ os-python-schemathesis/src/schemathesis/models.py
+@@ -34,7 +34,7 @@ import werkzeug
+ from hypothesis import event, note, reject
+ from hypothesis import strategies as st
+ from requests.structures import CaseInsensitiveDict
+-from starlette_testclient import TestClient as ASGIClient
++from schemathesis.starlette_testclient import TestClient as ASGIClient
+ 
+ from . import failures, serializers
+ from .auths import AuthStorage
+Index: os-python-schemathesis/src/schemathesis/specs/graphql/loaders.py
+===================================================================
+--- os-python-schemathesis.orig/src/schemathesis/specs/graphql/loaders.py
++++ os-python-schemathesis/src/schemathesis/specs/graphql/loaders.py
+@@ -7,7 +7,7 @@ import requests
+ from graphql import ExecutionResult
+ from pyrate_limiter import Limiter
+ from starlette.applications import Starlette
+-from starlette_testclient import TestClient as ASGIClient
++from schemathesis.starlette_testclient import TestClient as ASGIClient
+ from werkzeug import Client
+ from yarl import URL
+ 
+Index: os-python-schemathesis/src/schemathesis/specs/openapi/loaders.py
+===================================================================
+--- os-python-schemathesis.orig/src/schemathesis/specs/openapi/loaders.py
++++ os-python-schemathesis/src/schemathesis/specs/openapi/loaders.py
+@@ -11,7 +11,7 @@ import yaml
+ from jsonschema import ValidationError
+ from pyrate_limiter import Limiter
+ from starlette.applications import Starlette
+-from starlette_testclient import TestClient as ASGIClient
++from schemathesis.starlette_testclient import TestClient as ASGIClient
+ from werkzeug.test import Client
+ from yarl import URL
+ 
+Index: os-python-schemathesis/test/auth/test_pytest.py
+===================================================================
+--- os-python-schemathesis.orig/test/auth/test_pytest.py
++++ os-python-schemathesis/test/auth/test_pytest.py
+@@ -100,7 +100,7 @@ class Auth:
+ """
+     if python_app_type == "asgi":
+         return """
+-from starlette_testclient import TestClient
++from schemathesis.starlette_testclient import TestClient
+ 
+ @schema.auth()
+ class Auth:
