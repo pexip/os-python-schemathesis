@@ -3,3 +3,4 @@ remove-junit-xml.patch
 tests-skip-cli-entrypoints.patch
 #pytest-subtest-0.9.x.patch
 starlette_client_fork.patch
+cryptography.patch
