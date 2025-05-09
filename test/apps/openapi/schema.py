@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from enum import Enum
-from typing import Any, Dict, Tuple
+from typing import Any
 
 import jsonschema
 
@@ -27,6 +29,8 @@ class Operation(Enum):
     teapot = ("POST", "/api/teapot")
     text = ("GET", "/api/text")
     cp866 = ("GET", "/api/cp866")
+    always_incorrect = ("GET", "/api/always_incorrect")
+    always_incorrect_options = ("OPTIONS", "/api/always_incorrect")
     conformance = ("GET", "/api/conformance")
     plain_text_body = ("POST", "/api/text")
     csv_payload = ("POST", "/api/csv")
@@ -39,6 +43,7 @@ class Operation(Enum):
     reserved = ("GET", "/api/foo:bar")
     read_only = ("GET", "/api/read_only")
     write_only = ("POST", "/api/write_only")
+    ignored_auth = ("GET", "/api/ignored_auth")
 
     create_user = ("POST", "/api/users/")
     get_user = ("GET", "/api/users/{user_id}")
@@ -62,7 +67,7 @@ class OpenAPIVersion(Enum):
         return self.value == "3.0"
 
 
-def make_openapi_schema(operations: Tuple[str, ...], version: OpenAPIVersion = OpenAPIVersion("2.0")) -> Dict:
+def make_openapi_schema(operations: tuple[str, ...], version: OpenAPIVersion = OpenAPIVersion("2.0")) -> dict:
     """Generate an OAS 2/3 schemas with the given API operations.
 
     Example:
@@ -113,8 +118,8 @@ PAYLOAD = {
 PAYLOAD_VALIDATOR = jsonschema.validators.Draft4Validator({"anyOf": [{"type": "null"}, PAYLOAD]})
 
 
-def _make_openapi_2_schema(operations: Tuple[str, ...]) -> Dict:
-    template: Dict[str, Any] = {
+def _make_openapi_2_schema(operations: tuple[str, ...]) -> dict:
+    template: dict[str, Any] = {
         "swagger": "2.0",
         "info": {"title": "Example API", "description": "An API to test Schemathesis", "version": "1.0.0"},
         "host": "127.0.0.1:8888",
@@ -125,6 +130,7 @@ def _make_openapi_2_schema(operations: Tuple[str, ...]) -> Dict:
         "securityDefinitions": {
             "api_key": {"type": "apiKey", "name": "X-Token", "in": "header"},
             "basicAuth": {"type": "basic"},
+            "heisenAuth": {"type": "basic"},
         },
     }
 
@@ -158,8 +164,11 @@ def _make_openapi_2_schema(operations: Tuple[str, ...]) -> Dict:
             definitions = template.setdefault("definitions", {})
             definitions["Node"] = make_node_definition(reference)
         elif name in ("payload", "get_payload"):
+            payload = {**PAYLOAD}
+            payload["x-example"] = payload["example"]
+            del payload["example"]
             schema = {
-                "parameters": [{"name": "body", "in": "body", "required": True, "schema": PAYLOAD}],
+                "parameters": [{"name": "body", "in": "body", "required": True, "schema": payload}],
                 "responses": {"200": {"description": "OK", "schema": PAYLOAD}},
             }
         elif name == "unsatisfiable":
@@ -197,6 +206,7 @@ def _make_openapi_2_schema(operations: Tuple[str, ...]) -> Dict:
             }
         elif name == "upload_file":
             schema = {
+                "x-property": 42,
                 "parameters": [
                     {"name": "note", "in": "formData", "required": True, "type": "string"},
                     {"name": "data", "in": "formData", "required": True, "type": "file"},
@@ -302,6 +312,7 @@ def _make_openapi_2_schema(operations: Tuple[str, ...]) -> Dict:
                             "required": ["first_name", "last_name"],
                             "additionalProperties": False,
                         },
+                        "x-example": {"first_name": "John", "last_name": "Doe"},
                     }
                 ],
                 "responses": {"201": {"$ref": "#/x-components/responses/ResponseWithLinks"}},
@@ -335,7 +346,7 @@ def _make_openapi_2_schema(operations: Tuple[str, ...]) -> Dict:
                 "operationId": "getUser",
                 "parameters": [
                     {"in": "query", "name": "code", "required": True, "type": "integer"},
-                    {"in": "query", "name": "user_id", "required": True, "type": "string"},
+                    {"in": "query", "name": "user_id", "required": True, "type": "string", "x-example": "test-id"},
                 ],
                 "responses": {
                     "200": {
@@ -430,6 +441,11 @@ def _make_openapi_2_schema(operations: Tuple[str, ...]) -> Dict:
                 },
             }
             add_read_write_only()
+        elif name == "ignored_auth":
+            schema = {
+                "security": [{"heisenAuth": []}],
+                "responses": {"200": {"description": "OK"}},
+            }
         else:
             schema = {
                 "responses": {
@@ -449,9 +465,9 @@ def _make_openapi_2_schema(operations: Tuple[str, ...]) -> Dict:
     return template
 
 
-def _make_openapi_3_schema(operations: Tuple[str, ...]) -> Dict:
+def _make_openapi_3_schema(operations: tuple[str, ...]) -> dict:
     _base_path = "api"
-    template: Dict[str, Any] = {
+    template: dict[str, Any] = {
         "openapi": "3.0.2",
         "info": {"title": "Example API", "description": "An API to test Schemathesis", "version": "1.0.0"},
         "paths": {},
@@ -460,6 +476,7 @@ def _make_openapi_3_schema(operations: Tuple[str, ...]) -> Dict:
             "securitySchemes": {
                 "api_key": {"type": "apiKey", "name": "X-Token", "in": "header"},
                 "basicAuth": {"type": "http", "scheme": "basic"},
+                "heisenAuth": {"type": "http", "scheme": "basic"},
             }
         },
     }
@@ -480,7 +497,7 @@ def _make_openapi_3_schema(operations: Tuple[str, ...]) -> Dict:
                     },
                 },
                 # If a readOnly or writeOnly property is included in the required list,
-                # required affects just the relevant scope – responses only or requests only
+                # required affects just the relevant scope - responses only or requests only
                 "required": ["read", "write"],
                 "additionalProperties": False,
             }
@@ -548,6 +565,7 @@ def _make_openapi_3_schema(operations: Tuple[str, ...]) -> Dict:
             }
         elif name == "upload_file":
             schema = {
+                "x-property": 42,
                 "requestBody": {
                     "required": True,
                     "content": {
@@ -700,7 +718,8 @@ def _make_openapi_3_schema(operations: Tuple[str, ...]) -> Dict:
                                 },
                                 "required": ["first_name", "last_name"],
                                 "additionalProperties": False,
-                            }
+                            },
+                            "example": {"first_name": "John", "last_name": "Doe"},
                         }
                     },
                     "required": True,
@@ -736,7 +755,13 @@ def _make_openapi_3_schema(operations: Tuple[str, ...]) -> Dict:
                 "operationId": "getUser",
                 "parameters": [
                     {"in": "query", "name": "code", "required": True, "schema": {"type": "integer"}},
-                    {"in": "query", "name": "user_id", "required": True, "schema": {"type": "string"}},
+                    {
+                        "in": "query",
+                        "name": "user_id",
+                        "required": True,
+                        "schema": {"type": "string"},
+                        "example": "test-id",
+                    },
                 ],
                 "responses": {
                     "200": {
@@ -826,6 +851,11 @@ def _make_openapi_3_schema(operations: Tuple[str, ...]) -> Dict:
                 },
             }
             add_read_write_only()
+        elif name == "ignored_auth":
+            schema = {
+                "security": [{"heisenAuth": []}],
+                "responses": {"200": {"description": "OK"}},
+            }
         else:
             schema = {
                 "responses": {

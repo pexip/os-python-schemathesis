@@ -1,20 +1,16 @@
-from ._compat import _install_hypothesis_jsonschema_compatibility_shim
+from __future__ import annotations
 
-_install_hypothesis_jsonschema_compatibility_shim()
+from typing import Any
 
-del _install_hypothesis_jsonschema_compatibility_shim
+from . import auths, checks, contrib, experimental, fixups, graphql, hooks, runner, serializers, targets
+from ._lazy_import import lazy_import
+from .constants import SCHEMATHESIS_VERSION
+from .generation import DataGenerationMethod, GenerationConfig, HeaderConfig
+from .hooks import HookContext
+from .models import Case
+from .specs import openapi
 
-from . import auths, checks, contrib, fixups, graphql, hooks, runner, serializers, targets  # noqa: E402
-from .constants import DataGenerationMethod, __version__  # noqa: E402
-from .models import Case  # noqa: E402
-from .specs import openapi  # noqa: E402
-from .specs.openapi._hypothesis import init_default_strategies  # noqa: E402
-from .utils import GenericResponse  # noqa: E402
-
-init_default_strategies()
-
-# Is not a part of the public API
-del init_default_strategies
+__version__ = SCHEMATHESIS_VERSION
 
 # Default loaders
 from_aiohttp = openapi.from_aiohttp
@@ -37,3 +33,58 @@ target = targets.register
 register_check = checks.register
 register_target = targets.register
 register_string_format = openapi.format
+
+__all__ = [
+    "auths",
+    "checks",
+    "experimental",
+    "contrib",
+    "fixups",
+    "graphql",
+    "hooks",
+    "runner",
+    "serializers",
+    "targets",
+    "DataGenerationMethod",
+    "SCHEMATHESIS_VERSION",
+    "Case",
+    "openapi",
+    "__version__",
+    "from_aiohttp",
+    "from_asgi",
+    "from_dict",
+    "from_file",
+    "from_path",
+    "from_pytest_fixture",
+    "from_uri",
+    "from_wsgi",
+    "auth",
+    "check",
+    "hook",
+    "serializer",
+    "target",
+    "register_check",
+    "register_target",
+    "register_string_format",
+    "HookContext",
+]
+
+
+def _load_generic_response() -> Any:
+    from .transports.responses import GenericResponse
+
+    return GenericResponse
+
+
+def _load_base_schema() -> Any:
+    from .schemas import BaseSchema
+
+    return BaseSchema
+
+
+_imports = {"GenericResponse": _load_generic_response, "BaseSchema": _load_base_schema}
+
+
+def __getattr__(name: str) -> Any:
+    # Some modules are relatively heavy, hence load them lazily to improve startup time for CLI
+    return lazy_import(__name__, name, _imports, globals())

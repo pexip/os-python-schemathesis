@@ -1,10 +1,16 @@
+from __future__ import annotations
+
 import json
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-from click.utils import LazyFile
+from .handlers import EventHandler
 
-from ..runner import events
-from .handlers import EventHandler, ExecutionContext
+if TYPE_CHECKING:
+    from click.utils import LazyFile
+
+    from ..runner import events
+    from .context import ExecutionContext
 
 
 @dataclass

@@ -1,12 +1,12 @@
 from typing import TYPE_CHECKING
 
-import requests
-
 from ..constants import BOM_MARK
 from ..hooks import HookContext, register, unregister
+from ..hooks import is_installed as global_is_installed
 
 if TYPE_CHECKING:
-    from .. import Case, GenericResponse
+    from ..models import Case
+    from ..transports.responses import GenericResponse
 
 
 def install() -> None:
@@ -17,6 +17,12 @@ def uninstall() -> None:
     unregister(after_call)
 
 
+def is_installed() -> bool:
+    return global_is_installed("after_call", after_call)
+
+
 def after_call(context: HookContext, case: "Case", response: "GenericResponse") -> None:
-    if isinstance(response, requests.Response) and response.encoding == "utf-8" and response.text[0:1] == BOM_MARK:
+    from requests import Response
+
+    if isinstance(response, Response) and response.encoding == "utf-8" and response.text[0:1] == BOM_MARK:
         response.encoding = "utf-8-sig"

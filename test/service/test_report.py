@@ -9,9 +9,9 @@ import pytest
 
 import schemathesis
 from schemathesis.cli import ExecutionContext
+from schemathesis.internal.datetime import current_datetime
 from schemathesis.runner import events
 from schemathesis.service import ci, metadata, report
-from schemathesis.utils import current_datetime
 
 
 def test_add_events(openapi3_schema_url, read_report):
@@ -24,9 +24,13 @@ def test_add_events(openapi3_schema_url, read_report):
     data = payload.getvalue()
     with read_report(data) as tar:
         members = tar.getmembers()
-        assert len(members) == 6
+        assert len(members) == 10
         expected = (
             "Initialized",
+            "BeforeProbing",
+            "AfterProbing",
+            "BeforeAnalysis",
+            "AfterAnalysis",
             "BeforeExecution",
             "AfterExecution",
             "BeforeExecution",
@@ -76,7 +80,7 @@ def test_do_not_send_incomplete_report_service(service_report_handler, service, 
 
 
 @pytest.mark.operations("success")
-def test_do_not_send_incomplete_report_file(file_report_handler, service, openapi3_schema_url):
+def test_do_not_send_incomplete_report_file(file_report_handler, openapi3_schema_url):
     # When the test process is interrupted or there is an internal error
     context = mock.create_autospec(ExecutionContext)
     for event in generate_events(openapi3_schema_url):

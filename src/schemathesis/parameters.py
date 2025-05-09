@@ -2,8 +2,11 @@
 
 These are basic entities that describe what data could be sent to the API.
 """
+
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Generator, Generic, List, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Generator, Generic, TypeVar
 
 if TYPE_CHECKING:
     from .models import APIOperation
@@ -38,12 +41,7 @@ class Parameter:
         """Whether the parameter is required for a successful API call."""
         raise NotImplementedError
 
-    @property
-    def example(self) -> Any:
-        """Parameter example."""
-        raise NotImplementedError
-
-    def serialize(self, operation: "APIOperation") -> str:
+    def serialize(self, operation: APIOperation) -> str:
         """Get parameter's string representation."""
         raise NotImplementedError
 
@@ -55,22 +53,25 @@ P = TypeVar("P", bound=Parameter)
 class ParameterSet(Generic[P]):
     """A set of parameters for the same location."""
 
-    items: List[P] = field(default_factory=list)
+    items: list[P] = field(default_factory=list)
+
+    def _repr_pretty_(self, *args: Any, **kwargs: Any) -> None: ...
 
     def add(self, parameter: P) -> None:
         """Add a new parameter."""
         self.items.append(parameter)
 
-    def get(self, name: str) -> Optional[P]:
+    def get(self, name: str) -> P | None:
         for parameter in self:
             if parameter.name == name:
                 return parameter
         return None
 
-    @property
-    def example(self) -> Dict[str, Any]:
-        """Composite example gathered from individual parameters."""
-        return {item.name: item.example for item in self.items if item.example}
+    def contains(self, name: str) -> bool:
+        return self.get(name) is not None
+
+    def __contains__(self, item: str) -> bool:
+        return self.contains(item)
 
     def __bool__(self) -> bool:
         return bool(self.items)
@@ -87,10 +88,3 @@ class ParameterSet(Generic[P]):
 
 class PayloadAlternatives(ParameterSet[P]):
     """A set of alternative payloads."""
-
-    @property
-    def example(self) -> Any:
-        """We take only the first example."""
-        # May be extended in the future
-        if self.items:
-            return self.items[0].example

@@ -1,15 +1,20 @@
 """Work with stored auth data."""
+
+from __future__ import annotations
+
 import enum
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any
 
 import tomli
 import tomli_w
 
-from ..types import PathLike
 from .constants import DEFAULT_HOSTNAME, DEFAULT_HOSTS_PATH, HOSTS_FORMAT_VERSION
+
+if TYPE_CHECKING:
+    from ..types import PathLike
 
 
 @dataclass
@@ -19,11 +24,11 @@ class HostData:
     hostname: str
     hosts_file: PathLike
 
-    def load(self) -> Dict[str, Any]:
+    def load(self) -> dict[str, Any]:
         return load(self.hosts_file).get(self.hostname, {})
 
     @property
-    def correlation_id(self) -> Optional[str]:
+    def correlation_id(self) -> str | None:
         return self.load().get("correlation_id")
 
     def store_correlation_id(self, correlation_id: str) -> None:
@@ -43,31 +48,24 @@ def store(token: str, hostname: str = DEFAULT_HOSTNAME, hosts_file: PathLike = D
     _dump_hosts(hosts_file, hosts)
 
 
-def load(path: PathLike) -> Dict[str, Any]:
+def load(path: PathLike) -> dict[str, Any]:
     """Load the given hosts file.
 
     Return an empty dict if it doesn't exist.
     """
+    from ..utils import _ensure_parent
+
     try:
         with open(path, "rb") as fd:
             return tomli.load(fd)
     except FileNotFoundError:
-        _try_make_config_directory(path)
+        _ensure_parent(path)
         return {}
     except tomli.TOMLDecodeError:
         return {}
 
 
-def _try_make_config_directory(path: PathLike) -> None:
-    # Try to create the parent dir - it could be the first run, when the config dir doesn't exist yet
-    try:
-        Path(path).parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    except OSError:
-        # Ignore permission errors, etc
-        pass
-
-
-def load_for_host(hostname: str = DEFAULT_HOSTNAME, hosts_file: PathLike = DEFAULT_HOSTS_PATH) -> Dict[str, Any]:
+def load_for_host(hostname: str = DEFAULT_HOSTNAME, hosts_file: PathLike = DEFAULT_HOSTS_PATH) -> dict[str, Any]:
     """Load all data associated with a hostname."""
     return load(hosts_file).get(hostname, {})
 
@@ -97,7 +95,7 @@ def remove(hostname: str = DEFAULT_HOSTNAME, hosts_file: PathLike = DEFAULT_HOST
         return RemoveAuth.error
 
 
-def get_token(hostname: str = DEFAULT_HOSTNAME, hosts_file: PathLike = DEFAULT_HOSTS_PATH) -> Optional[str]:
+def get_token(hostname: str = DEFAULT_HOSTNAME, hosts_file: PathLike = DEFAULT_HOSTS_PATH) -> str | None:
     """Load a token for a host."""
     return load_for_host(hostname, hosts_file).get("token")
 
@@ -107,7 +105,7 @@ def get_temporary_hosts_file() -> str:
     return str(temporary_dir / "schemathesis-hosts.toml")
 
 
-def _dump_hosts(path: PathLike, hosts: Dict[str, Any]) -> None:
+def _dump_hosts(path: PathLike, hosts: dict[str, Any]) -> None:
     """Write hosts data to a file."""
     with open(path, "wb") as fd:
         tomli_w.dump(hosts, fd)

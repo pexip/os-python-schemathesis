@@ -1,123 +1,199 @@
-"""Schema objects provide a convenient interface to raw schemas.
+from __future__ import annotations
 
-Their responsibilities:
-  - Provide a unified way to work with different types of schemas
-  - Give all paths / methods combinations that are available directly from the schema;
-
-They give only static definitions of paths.
-"""
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from difflib import get_close_matches
 from functools import lru_cache
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     ContextManager,
-    Dict,
     Generator,
     Iterable,
     Iterator,
-    List,
     NoReturn,
-    Optional,
     Sequence,
-    Tuple,
-    Type,
     TypeVar,
-    Union,
 )
 from urllib.parse import quote, unquote, urljoin, urlparse, urlsplit, urlunsplit
 
-import hypothesis
-from hypothesis.strategies import SearchStrategy
-from pyrate_limiter import Limiter
-from requests.structures import CaseInsensitiveDict
-
+from ._dependency_versions import IS_PYRATE_LIMITER_ABOVE_3
 from ._hypothesis import create_test
 from .auths import AuthStorage
-from .constants import DEFAULT_DATA_GENERATION_METHODS, CodeSampleStyle, DataGenerationMethod
-from .exceptions import InvalidSchema, UsageError
-from .hooks import HookContext, HookDispatcher, HookScope, dispatch
-from .models import APIOperation, Case
-from .stateful import APIStateMachine, Stateful, StatefulTest
-from .types import (
-    Body,
-    Cookies,
-    DataGenerationMethodInput,
-    Filter,
-    FormData,
-    GenericTest,
-    Headers,
-    NotSet,
-    PathParameters,
-    Query,
+from .code_samples import CodeSampleStyle
+from .constants import NOT_SET
+from .exceptions import OperationSchemaError, UsageError
+from .filters import (
+    FilterSet,
+    FilterValue,
+    MatcherFunc,
+    RegexValue,
+    filter_set_from_components,
+    is_deprecated,
 )
-from .utils import NOT_SET, PARAMETRIZE_MARKER, GenericResponse, GivenInput, Ok, Result, given_proxy
+from .generation import (
+    DEFAULT_DATA_GENERATION_METHODS,
+    DataGenerationMethod,
+    DataGenerationMethodInput,
+    GenerationConfig,
+    combine_strategies,
+)
+from .hooks import HookContext, HookDispatcher, HookScope, dispatch, to_filterable_hook
+from .internal.deprecation import warn_filtration_arguments
+from .internal.output import OutputConfig
+from .internal.result import Ok, Result
+from .models import APIOperation, Case
+from .utils import PARAMETRIZE_MARKER, GivenInput, given_proxy
 
+if TYPE_CHECKING:
+    import hypothesis
+    from hypothesis.strategies import SearchStrategy
+    from pyrate_limiter import Limiter
 
-class MethodsDict(CaseInsensitiveDict):
-    """Container for accessing API operations.
-
-    Provides a more specific error message if API operation is not found.
-    """
-
-    def __getitem__(self, item: Any) -> Any:
-        try:
-            return super().__getitem__(item)
-        except KeyError as exc:
-            available_methods = ", ".join(map(str.upper, self))
-            message = f"Method `{item}` not found. Available methods: {available_methods}"
-            raise KeyError(message) from exc
+    from .stateful import Stateful, StatefulTest
+    from .stateful.state_machine import APIStateMachine
+    from .transports import Transport
+    from .transports.responses import GenericResponse
+    from .types import (
+        Body,
+        Cookies,
+        Filter,
+        FormData,
+        GenericTest,
+        Headers,
+        NotSet,
+        PathParameters,
+        Query,
+        Specification,
+    )
 
 
 C = TypeVar("C", bound=Case)
 
 
-@lru_cache()
+@lru_cache
 def get_full_path(base_path: str, path: str) -> str:
     return unquote(urljoin(base_path, quote(path.lstrip("/"))))
 
 
 @dataclass(eq=False)
 class BaseSchema(Mapping):
-    raw_schema: Dict[str, Any]
-    location: Optional[str] = None
-    base_url: Optional[str] = None
-    method: Optional[Filter] = None
-    endpoint: Optional[Filter] = None
-    tag: Optional[Filter] = None
-    operation_id: Optional[Filter] = None
+    raw_schema: dict[str, Any]
+    transport: Transport
+    specification: Specification
+    location: str | None = None
+    base_url: str | None = None
+    filter_set: FilterSet = field(default_factory=FilterSet)
     app: Any = None
     hooks: HookDispatcher = field(default_factory=lambda: HookDispatcher(scope=HookScope.SCHEMA))
     auth: AuthStorage = field(default_factory=AuthStorage)
-    test_function: Optional[GenericTest] = None
+    test_function: GenericTest | None = None
     validate_schema: bool = True
-    skip_deprecated_operations: bool = False
-    data_generation_methods: List[DataGenerationMethod] = field(
+    data_generation_methods: list[DataGenerationMethod] = field(
         default_factory=lambda: list(DEFAULT_DATA_GENERATION_METHODS)
     )
+    generation_config: GenerationConfig = field(default_factory=GenerationConfig)
+    output_config: OutputConfig = field(default_factory=OutputConfig)
     code_sample_style: CodeSampleStyle = CodeSampleStyle.default()
-    rate_limiter: Optional[Limiter] = None
+    rate_limiter: Limiter | None = None
+    sanitize_output: bool = True
+
+    def __post_init__(self) -> None:
+        self.hook = to_filterable_hook(self.hooks)  # type: ignore[method-assign]
+
+    def _repr_pretty_(self, *args: Any, **kwargs: Any) -> None: ...
+
+    def include(
+        self,
+        func: MatcherFunc | None = None,
+        *,
+        name: FilterValue | None = None,
+        name_regex: str | None = None,
+        method: FilterValue | None = None,
+        method_regex: str | None = None,
+        path: FilterValue | None = None,
+        path_regex: str | None = None,
+        tag: FilterValue | None = None,
+        tag_regex: RegexValue | None = None,
+        operation_id: FilterValue | None = None,
+        operation_id_regex: RegexValue | None = None,
+    ) -> BaseSchema:
+        """Include only operations that match the given filters."""
+        filter_set = self.filter_set.clone()
+        filter_set.include(
+            func,
+            name=name,
+            name_regex=name_regex,
+            method=method,
+            method_regex=method_regex,
+            path=path,
+            path_regex=path_regex,
+            tag=tag,
+            tag_regex=tag_regex,
+            operation_id=operation_id,
+            operation_id_regex=operation_id_regex,
+        )
+        return self.clone(filter_set=filter_set)
+
+    def exclude(
+        self,
+        func: MatcherFunc | None = None,
+        *,
+        name: FilterValue | None = None,
+        name_regex: str | None = None,
+        method: FilterValue | None = None,
+        method_regex: str | None = None,
+        path: FilterValue | None = None,
+        path_regex: str | None = None,
+        tag: FilterValue | None = None,
+        tag_regex: RegexValue | None = None,
+        operation_id: FilterValue | None = None,
+        operation_id_regex: RegexValue | None = None,
+        deprecated: bool = False,
+    ) -> BaseSchema:
+        """Include only operations that match the given filters."""
+        filter_set = self.filter_set.clone()
+        if deprecated:
+            if func is None:
+                func = is_deprecated
+            else:
+                filter_set.exclude(is_deprecated)
+        filter_set.exclude(
+            func,
+            name=name,
+            name_regex=name_regex,
+            method=method,
+            method_regex=method_regex,
+            path=path,
+            path_regex=path_regex,
+            tag=tag,
+            tag_regex=tag_regex,
+            operation_id=operation_id,
+            operation_id_regex=operation_id_regex,
+        )
+        return self.clone(filter_set=filter_set)
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self.operations)
+        raise NotImplementedError
 
-    def __getitem__(self, item: str) -> MethodsDict:
+    def __getitem__(self, item: str) -> APIOperationMap:
+        __tracebackhide__ = True
         try:
-            return self.operations[item]
+            return self._get_operation_map(item)
         except KeyError as exc:
-            matches = get_close_matches(item, list(self.operations))
-            message = f"`{item}` not found"
-            if matches:
-                message += f". Did you mean `{matches[0]}`?"
-            raise KeyError(message) from exc
+            self.on_missing_operation(item, exc)
+
+    def _get_operation_map(self, key: str) -> APIOperationMap:
+        raise NotImplementedError
+
+    def on_missing_operation(self, item: str, exc: KeyError) -> NoReturn:
+        raise NotImplementedError
 
     def __len__(self) -> int:
-        return len(self.operations)
+        return self.operations_count
 
-    def hook(self, hook: Union[str, Callable]) -> Callable:
+    def hook(self, hook: str | Callable) -> Callable:
         return self.hooks.register(hook)
 
     @property
@@ -155,76 +231,104 @@ class BaseSchema(Mapping):
             return base_url.rstrip("/")
         return self._build_base_url()
 
-    @property
-    def operations(self) -> Dict[str, MethodsDict]:
-        if not hasattr(self, "_operations"):
-            operations = self.get_all_operations()
-            self._operations = operations_to_dict(operations)
-        return self._operations
+    def validate(self) -> None:
+        raise NotImplementedError
 
     @property
     def operations_count(self) -> int:
         raise NotImplementedError
 
-    def get_all_operations(self) -> Generator[Result[APIOperation, InvalidSchema], None, None]:
+    @property
+    def links_count(self) -> int:
         raise NotImplementedError
 
-    def get_strategies_from_examples(self, operation: APIOperation) -> List[SearchStrategy[Case]]:
+    def get_all_operations(
+        self, hooks: HookDispatcher | None = None, generation_config: GenerationConfig | None = None
+    ) -> Generator[Result[APIOperation, OperationSchemaError], None, None]:
+        raise NotImplementedError
+
+    def get_strategies_from_examples(
+        self, operation: APIOperation, as_strategy_kwargs: dict[str, Any] | None = None
+    ) -> list[SearchStrategy[Case]]:
         """Get examples from the API operation."""
         raise NotImplementedError
 
-    def get_security_requirements(self, operation: APIOperation) -> List[str]:
+    def get_security_requirements(self, operation: APIOperation) -> list[str]:
         """Get applied security requirements for the given API operation."""
         raise NotImplementedError
 
     def get_stateful_tests(
-        self, response: GenericResponse, operation: APIOperation, stateful: Optional[Stateful]
+        self, response: GenericResponse, operation: APIOperation, stateful: Stateful | None
     ) -> Sequence[StatefulTest]:
         """Get a list of additional tests, that should be executed after this response from the API operation."""
         raise NotImplementedError
 
-    def get_parameter_serializer(self, operation: APIOperation, location: str) -> Optional[Callable]:
+    def get_parameter_serializer(self, operation: APIOperation, location: str) -> Callable | None:
         """Get a function that serializes parameters for the given location."""
         raise NotImplementedError
 
     def get_all_tests(
         self,
         func: Callable,
-        settings: Optional[hypothesis.settings] = None,
-        seed: Optional[int] = None,
-        as_strategy_kwargs: Optional[Dict[str, Any]] = None,
-        _given_kwargs: Optional[Dict[str, GivenInput]] = None,
-    ) -> Generator[Result[Tuple[APIOperation, Callable], InvalidSchema], None, None]:
+        settings: hypothesis.settings | None = None,
+        generation_config: GenerationConfig | None = None,
+        seed: int | None = None,
+        as_strategy_kwargs: dict[str, Any] | Callable[[APIOperation], dict[str, Any]] | None = None,
+        hooks: HookDispatcher | None = None,
+        _given_kwargs: dict[str, GivenInput] | None = None,
+    ) -> Generator[Result[tuple[APIOperation, Callable], OperationSchemaError], None, None]:
         """Generate all operations and Hypothesis tests for them."""
-        for result in self.get_all_operations():
+        for result in self.get_all_operations(hooks=hooks, generation_config=generation_config):
             if isinstance(result, Ok):
+                operation = result.ok()
+                _as_strategy_kwargs: dict[str, Any] | None
+                if callable(as_strategy_kwargs):
+                    _as_strategy_kwargs = as_strategy_kwargs(operation)
+                else:
+                    _as_strategy_kwargs = as_strategy_kwargs
                 test = create_test(
-                    operation=result.ok(),
+                    operation=operation,
                     test=func,
                     settings=settings,
                     seed=seed,
                     data_generation_methods=self.data_generation_methods,
-                    as_strategy_kwargs=as_strategy_kwargs,
+                    generation_config=generation_config,
+                    as_strategy_kwargs=_as_strategy_kwargs,
                     _given_kwargs=_given_kwargs,
                 )
-                yield Ok((result.ok(), test))
+                yield Ok((operation, test))
             else:
                 yield result
 
     def parametrize(
         self,
-        method: Optional[Filter] = NOT_SET,
-        endpoint: Optional[Filter] = NOT_SET,
-        tag: Optional[Filter] = NOT_SET,
-        operation_id: Optional[Filter] = NOT_SET,
-        validate_schema: Union[bool, NotSet] = NOT_SET,
-        skip_deprecated_operations: Union[bool, NotSet] = NOT_SET,
-        data_generation_methods: Union[Iterable[DataGenerationMethod], NotSet] = NOT_SET,
-        code_sample_style: Union[str, NotSet] = NOT_SET,
+        method: Filter | None = NOT_SET,
+        endpoint: Filter | None = NOT_SET,
+        tag: Filter | None = NOT_SET,
+        operation_id: Filter | None = NOT_SET,
+        validate_schema: bool | NotSet = NOT_SET,
+        skip_deprecated_operations: bool | NotSet = NOT_SET,
+        data_generation_methods: Iterable[DataGenerationMethod] | NotSet = NOT_SET,
+        code_sample_style: str | NotSet = NOT_SET,
     ) -> Callable:
         """Mark a test function as a parametrized one."""
         _code_sample_style = (
             CodeSampleStyle.from_str(code_sample_style) if isinstance(code_sample_style, str) else code_sample_style
+        )
+
+        for name in ("method", "endpoint", "tag", "operation_id", "skip_deprecated_operations"):
+            value = locals()[name]
+            if value is not NOT_SET:
+                warn_filtration_arguments(name)
+
+        filter_set = filter_set_from_components(
+            include=True,
+            method=method,
+            endpoint=endpoint,
+            tag=tag,
+            operation_id=operation_id,
+            skip_deprecated_operations=skip_deprecated_operations,
+            parent=self.filter_set,
         )
 
         def wrapper(func: GenericTest) -> GenericTest:
@@ -241,13 +345,9 @@ class BaseSchema(Mapping):
             HookDispatcher.add_dispatcher(func)
             cloned = self.clone(
                 test_function=func,
-                method=method,
-                endpoint=endpoint,
-                tag=tag,
-                operation_id=operation_id,
                 validate_schema=validate_schema,
-                skip_deprecated_operations=skip_deprecated_operations,
                 data_generation_methods=data_generation_methods,
+                filter_set=filter_set,
                 code_sample_style=_code_sample_style,  # type: ignore
             )
             setattr(func, PARAMETRIZE_MARKER, cloned)
@@ -262,68 +362,66 @@ class BaseSchema(Mapping):
     def clone(
         self,
         *,
-        base_url: Union[Optional[str], NotSet] = NOT_SET,
-        test_function: Optional[GenericTest] = None,
-        method: Optional[Filter] = NOT_SET,
-        endpoint: Optional[Filter] = NOT_SET,
-        tag: Optional[Filter] = NOT_SET,
-        operation_id: Optional[Filter] = NOT_SET,
+        base_url: str | None | NotSet = NOT_SET,
+        test_function: GenericTest | None = None,
         app: Any = NOT_SET,
-        hooks: Union[HookDispatcher, NotSet] = NOT_SET,
-        auth: Union[AuthStorage, NotSet] = NOT_SET,
-        validate_schema: Union[bool, NotSet] = NOT_SET,
-        skip_deprecated_operations: Union[bool, NotSet] = NOT_SET,
-        data_generation_methods: Union[DataGenerationMethodInput, NotSet] = NOT_SET,
-        code_sample_style: Union[CodeSampleStyle, NotSet] = NOT_SET,
-        rate_limiter: Optional[Limiter] = NOT_SET,
-    ) -> "BaseSchema":
+        hooks: HookDispatcher | NotSet = NOT_SET,
+        auth: AuthStorage | NotSet = NOT_SET,
+        validate_schema: bool | NotSet = NOT_SET,
+        data_generation_methods: DataGenerationMethodInput | NotSet = NOT_SET,
+        generation_config: GenerationConfig | NotSet = NOT_SET,
+        output_config: OutputConfig | NotSet = NOT_SET,
+        code_sample_style: CodeSampleStyle | NotSet = NOT_SET,
+        rate_limiter: Limiter | None = NOT_SET,
+        sanitize_output: bool | NotSet | None = NOT_SET,
+        filter_set: FilterSet | None = None,
+    ) -> BaseSchema:
         if base_url is NOT_SET:
             base_url = self.base_url
-        if method is NOT_SET:
-            method = self.method
-        if endpoint is NOT_SET:
-            endpoint = self.endpoint
-        if tag is NOT_SET:
-            tag = self.tag
-        if operation_id is NOT_SET:
-            operation_id = self.operation_id
         if app is NOT_SET:
             app = self.app
         if validate_schema is NOT_SET:
             validate_schema = self.validate_schema
-        if skip_deprecated_operations is NOT_SET:
-            skip_deprecated_operations = self.skip_deprecated_operations
+        if filter_set is None:
+            filter_set = self.filter_set
         if hooks is NOT_SET:
             hooks = self.hooks
         if auth is NOT_SET:
             auth = self.auth
         if data_generation_methods is NOT_SET:
             data_generation_methods = self.data_generation_methods
+        if generation_config is NOT_SET:
+            generation_config = self.generation_config
+        if output_config is NOT_SET:
+            output_config = self.output_config
         if code_sample_style is NOT_SET:
             code_sample_style = self.code_sample_style
         if rate_limiter is NOT_SET:
             rate_limiter = self.rate_limiter
+        if sanitize_output is NOT_SET:
+            sanitize_output = self.sanitize_output
 
         return self.__class__(
             self.raw_schema,
+            specification=self.specification,
             location=self.location,
             base_url=base_url,  # type: ignore
-            method=method,
-            endpoint=endpoint,
-            tag=tag,
-            operation_id=operation_id,
             app=app,
             hooks=hooks,  # type: ignore
             auth=auth,  # type: ignore
             test_function=test_function,
             validate_schema=validate_schema,  # type: ignore
-            skip_deprecated_operations=skip_deprecated_operations,  # type: ignore
             data_generation_methods=data_generation_methods,  # type: ignore
+            generation_config=generation_config,  # type: ignore
+            output_config=output_config,  # type: ignore
             code_sample_style=code_sample_style,  # type: ignore
             rate_limiter=rate_limiter,  # type: ignore
+            sanitize_output=sanitize_output,  # type: ignore
+            filter_set=filter_set,  # type: ignore
+            transport=self.transport,
         )
 
-    def get_local_hook_dispatcher(self) -> Optional[HookDispatcher]:
+    def get_local_hook_dispatcher(self) -> HookDispatcher | None:
         """Get a HookDispatcher instance bound to the test if present."""
         # It might be not present when it is used without pytest via `APIOperation.as_strategy()`
         if self.test_function is not None:
@@ -341,51 +439,52 @@ class BaseSchema(Mapping):
 
     def prepare_multipart(
         self, form_data: FormData, operation: APIOperation
-    ) -> Tuple[Optional[List], Optional[Dict[str, Any]]]:
+    ) -> tuple[list | None, dict[str, Any] | None]:
         """Split content of `form_data` into files & data.
 
         Forms may contain file fields, that we should send via `files` argument in `requests`.
         """
         raise NotImplementedError
 
-    def get_request_payload_content_types(self, operation: APIOperation) -> List[str]:
+    def get_request_payload_content_types(self, operation: APIOperation) -> list[str]:
         raise NotImplementedError
 
     def make_case(
         self,
         *,
-        case_cls: Type[C],
+        case_cls: type[C],
         operation: APIOperation,
-        path_parameters: Optional[PathParameters] = None,
-        headers: Optional[Headers] = None,
-        cookies: Optional[Cookies] = None,
-        query: Optional[Query] = None,
-        body: Union[Body, NotSet] = NOT_SET,
-        media_type: Optional[str] = None,
+        path_parameters: PathParameters | None = None,
+        headers: Headers | None = None,
+        cookies: Cookies | None = None,
+        query: Query | None = None,
+        body: Body | NotSet = NOT_SET,
+        media_type: str | None = None,
     ) -> C:
         raise NotImplementedError
 
     def get_case_strategy(
         self,
         operation: APIOperation,
-        hooks: Optional[HookDispatcher] = None,
-        auth_storage: Optional[AuthStorage] = None,
+        hooks: HookDispatcher | None = None,
+        auth_storage: AuthStorage | None = None,
         data_generation_method: DataGenerationMethod = DataGenerationMethod.default(),
+        generation_config: GenerationConfig | None = None,
         **kwargs: Any,
     ) -> SearchStrategy:
         raise NotImplementedError
 
-    def as_state_machine(self) -> Type[APIStateMachine]:
-        """Create a state machine class.
-
-        Use it for stateful testing.
-        """
+    def as_state_machine(self) -> type[APIStateMachine]:
+        """Create a state machine class."""
         raise NotImplementedError
 
-    def get_links(self, operation: APIOperation) -> Dict[str, Dict[str, Any]]:
+    def get_links(self, operation: APIOperation) -> dict[str, dict[str, Any]]:
         raise NotImplementedError
 
-    def validate_response(self, operation: APIOperation, response: GenericResponse) -> None:
+    def get_tags(self, operation: APIOperation) -> list[str] | None:
+        raise NotImplementedError
+
+    def validate_response(self, operation: APIOperation, response: GenericResponse) -> bool | None:
         raise NotImplementedError
 
     def prepare_schema(self, schema: Any) -> Any:
@@ -395,17 +494,69 @@ class BaseSchema(Mapping):
         """Limit the rate of sending generated requests."""
         label = urlparse(self.base_url).netloc
         if self.rate_limiter is not None:
-            return self.rate_limiter.ratelimit(label, delay=True, max_delay=0)
+            if IS_PYRATE_LIMITER_ABOVE_3:
+                self.rate_limiter.try_acquire(label)
+            else:
+                return self.rate_limiter.ratelimit(label, delay=True, max_delay=0)
         return nullcontext()
 
+    def _get_payload_schema(self, definition: dict[str, Any], media_type: str) -> dict[str, Any] | None:
+        raise NotImplementedError
 
-def operations_to_dict(
-    operations: Generator[Result[APIOperation, InvalidSchema], None, None]
-) -> Dict[str, MethodsDict]:
-    output: Dict[str, MethodsDict] = {}
-    for result in operations:
-        if isinstance(result, Ok):
-            operation = result.ok()
-            output.setdefault(operation.path, MethodsDict())
-            output[operation.path][operation.method] = operation
-    return output
+    def as_strategy(
+        self,
+        hooks: HookDispatcher | None = None,
+        auth_storage: AuthStorage | None = None,
+        data_generation_method: DataGenerationMethod = DataGenerationMethod.default(),
+        generation_config: GenerationConfig | None = None,
+        **kwargs: Any,
+    ) -> SearchStrategy:
+        """Build a strategy for generating test cases for all defined API operations."""
+        strategies = [
+            operation.ok().as_strategy(
+                hooks=hooks,
+                auth_storage=auth_storage,
+                data_generation_method=data_generation_method,
+                generation_config=generation_config,
+                **kwargs,
+            )
+            for operation in self.get_all_operations(hooks=hooks)
+            if isinstance(operation, Ok)
+        ]
+        return combine_strategies(strategies)
+
+
+@dataclass
+class APIOperationMap(Mapping):
+    _schema: BaseSchema
+    _data: Mapping
+
+    def __getitem__(self, item: str) -> APIOperation:
+        return self._data[item]
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def as_strategy(
+        self,
+        hooks: HookDispatcher | None = None,
+        auth_storage: AuthStorage | None = None,
+        data_generation_method: DataGenerationMethod = DataGenerationMethod.default(),
+        generation_config: GenerationConfig | None = None,
+        **kwargs: Any,
+    ) -> SearchStrategy:
+        """Build a strategy for generating test cases for all API operations defined in this subset."""
+        strategies = [
+            operation.as_strategy(
+                hooks=hooks,
+                auth_storage=auth_storage,
+                data_generation_method=data_generation_method,
+                generation_config=generation_config,
+                **kwargs,
+            )
+            for operation in self._data.values()
+        ]
+        return combine_strategies(strategies)

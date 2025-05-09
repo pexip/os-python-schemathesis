@@ -1,8 +1,12 @@
-from dataclasses import dataclass
-from typing import Optional
+from __future__ import annotations
 
-from ..utils import format_exception
-from . import ci
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from ..exceptions import format_exception
+
+if TYPE_CHECKING:
+    from . import ci
 
 
 class Event:
@@ -21,7 +25,7 @@ class Metadata(Event):
     """Meta-information about the report."""
 
     size: int
-    ci_environment: Optional[ci.Environment]
+    ci_environment: ci.Environment | None
 
 
 @dataclass

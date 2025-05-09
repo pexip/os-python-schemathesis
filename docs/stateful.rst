@@ -7,6 +7,10 @@ It works great when you need to quickly verify that your operations properly val
 
 With stateful testing, Schemathesis combines multiple API calls into a single test scenario and tries to find call sequences that fail.
 
+Stateful tests in Schemathesis rely on Open API links to function, as they are designed to target stateful transitions between API endpoints.
+Unlike stateless tests, which verify individual endpoints in isolation, stateful tests require these links to sequence API calls logically. 
+Ensure your schema includes Open API links to leverage stateful testing effectively.
+
 Why is it useful?
 -----------------
 
@@ -151,7 +155,7 @@ How to customize tests
 If you want to change a single scenario's behavior, you need to extend the state machine. Each scenario
 gets a freshly created state machine instance that runs a sequence of steps.
 
-.. autoclass:: schemathesis.stateful.APIStateMachine
+.. autoclass:: schemathesis.stateful.state_machine.APIStateMachine
 
     The following methods are executed only once per test scenario.
 
@@ -481,10 +485,62 @@ Each additional test will be indented and prefixed with ``->`` in the CLI output
 You can specify recursive links if you want. The default recursion depth limit is **5** and can be changed with the
 ``--stateful-recursion-limit=<N>`` CLI option.
 
-Schemathesis's CLI currently uses the old approach to stateful testing, not based on state machines.
-We plan to use the new approach in CLI in the future. It may include slight changes to the visual
-appearance and the way to configure it. It also means that using stateful testing in CLI is not yet as customizable
-as in the in-code approach.
+Schemathesis's CLI now supports the new approach to stateful testing based on state machines. 
+It is available as an experimental feature and can be enabled using the ``--experimental=stateful-test-runner`` CLI option or by setting the
+``SCHEMATHESIS_EXPERIMENTAL_STATEFUL_TEST_RUNNER=true`` environment variable. For more information, refer to the :ref:`stateful-test-runner` section.
+
+.. code-block::
+
+    Links                                                  2xx    4xx    5xx    Total
+
+    POST /api/users/
+    └── 201
+        ├── GET /api/users/{user_id}                       765      0    101      866
+        └── PATCH /api/users/{user_id}                     765      0      0      765
+
+    GET /api/users/{user_id}
+    └── 200
+        └── PATCH /api/users/{user_id}                     513      0      0      513
+
+
+The old approach to stateful testing, not based on state machines, is still the default in the CLI. 
+However, we recommend using the new approach as it offers more effective testing. 
+In the future, the new approach will become the default in the CLI, and the old approach will be removed.
+
+Please note that the visual appearance and configuration options for stateful testing in the CLI may differ slightly from the in-code approach. 
+We are continuously working on improving the CLI experience and aligning it with the in-code approach.
+
+Extracting data from headers and query parameters
+-------------------------------------------------
+
+By default, Schemathesis allows you to extract data from the response body of an API endpoint, based on the provided schema. 
+However, sometimes you might need to extract data from other parts of the API response, such as headers, path or query parameters.
+
+Schemathesis provides an additional feature that allows you to use regular expressions to extract data from the string values of headers and query parameters.
+This can be particularly useful when the API response includes important information in these locations, and you need to use that data for further processing.
+
+Here's an example of how to extract the user ID from the ``Location`` header of a ``201 Created`` response:
+
+.. code-block::
+   :emphasize-lines: 12-12
+
+    paths:
+      /users:
+        post:
+          ...
+          responses:
+            '201':
+              ...
+              links:
+                GetUserByUserId:
+                  operationId: getUser
+                  parameters:
+                    userId: '$response.header.Location#regex:/users/(.+)'
+
+For example, if the ``Location`` header is ``/users/42``, the ``userId`` parameter will be set to ``42``.
+The regular expression should be a valid Python regular expression and should contain a single capturing group.
+
+If the regular expression does not match the value, the parameter will be set to empty.
 
 Open API links limitations
 --------------------------
@@ -499,9 +555,91 @@ following restriction:
   It is done due to ambiguity in the runtime expressions syntax, where ``}`` cannot be distinguished from an
   embedded runtime expression's closing bracket.
 
-**IMPORTANT**. The Open API standard defines ``requestBody`` keyword value in this way:
+For building ``requestBody``, the Open API standard only allows for literal values or expressions:
 
     A literal value or {expression} to use as a request body when calling the target operation.
 
-It means you cannot use multiple runtime expressions for different parameters, and you always have to provide either a literal
-or an expression.
+Schemathesis extends the Open API standard by allowing for the evaluation of runtime expressions within the ``requestBody`` object or array.
+
+For example, the following requestBody definition is valid:
+
+.. code-block:: json
+
+  {
+      "key": "$response.body#/key",
+      "items": ["$response.body#/first", "literal", 42]
+  }
+
+In this example, the ``$response.body#/key`` and ``$response.body#/first`` expressions are used to dynamically retrieve values from the response body. 
+
+If the response body is ``{"key": "foo", "first": "bar"}``, then the resulting payload will be:
+
+.. code-block:: json
+
+  {
+      "key": "foo",
+      "items": ["bar", "literal", 42]
+  }
+
+This allows for building dynamic payloads where nested items are not hardcoded but instead evaluated at runtime.
+
+**IMPORTANT**: Non-string object keys are converted to stringified JSON values during evaluation.
+
+By default, Schemathesis merges the evaluated structure with a generated value, giving the evaluated value precedence.
+
+State Machine Test Runner
+-------------------------
+
+If you need to run stateful tests without using ``pytest``, you can use the Schemathesis state machine test runner.
+Similarly to the default Schemathesis test runner, it allows for running state machines and reacting to events from them.
+
+A test run is the entire process of running the state machine, which consists of multiple test suites. 
+Each test suite contains multiple test scenarios and is executed until no new failures are found. 
+The test run continues until a test suite is executed without finding any new failures.
+
+A test run is the entire process of running the state machine. It starts by generating a new test suite and executing it. 
+If the test suite finishes with any new failures, Schemathesis generates another test suite and runs it. 
+This process continues until a generated test suite finishes successfully without finding any new failures
+
+Each test suite contains multiple test scenarios. Each test scenario is a sequence of steps generated by the state machine, where each step typically represents an API call. 
+
+.. important::
+
+    Each test scenario may include multiple API calls but is considered as a single test case by Hypothesis.
+    Therefore, the ``max_examples`` setting controls the number of test scenarios, not the number of API calls.
+
+The available events are:
+
+ - ``RunStarted`` - triggered before the entire test run starts.
+ - ``RunFinished`` - triggered after the entire test run finishes.
+ - ``SuiteStarted`` - triggered before each test suite starts.
+ - ``SuiteFinished`` - triggered after each test suite finishes, providing information about the failed checks.
+ - ``ScenarioStarted`` - triggered before each test scenario starts.
+ - ``ScenarioFinished`` - triggered after each test scenario finishes.
+ - ``StepStarted`` - triggered before each step in a test scenario is executed.
+ - ``StepFinished`` - triggered after each step in a test scenario is executed.
+ - ``Interrupted`` - triggered when the test run is interrupted by the user (e.g., via Ctrl+C).
+ - ``Errored`` - triggered when an unexpected error occurs during the test run.
+
+These events are primarily used for monitoring and reporting purposes, allowing you to track the progress of the state machine test runner. 
+They provide information about the current state of the test run but do not offer any control over the test execution.
+
+To collect the events you may use a "sink" that consumes the events and collects statistics about the test run.
+
+.. code-block:: python
+
+    import schemathesis
+    from schemathesis.stateful import events
+
+    schema = schemathesis.from_uri("http://127.0.0.1:8080/swagger.json")
+    state_machine = schema.as_state_machine()
+    sink = state_machine.sink()
+
+    runner = state_machine.runner()
+    for event in runner.execute():
+        sink.consume(event)
+        if isinstance(event, events.RunFinished):
+            print("Test run finished")
+    print("Duration:", sink.duration)
+    for failure in sink.failures:
+        print(failure)

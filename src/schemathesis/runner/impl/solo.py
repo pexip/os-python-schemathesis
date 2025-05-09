@@ -1,46 +1,42 @@
-import threading
-from dataclasses import dataclass
-from typing import Generator, Optional, Union
+from __future__ import annotations
 
-from ...models import TestResultSet
-from ...types import RequestCert
-from ...utils import get_requests_auth
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Generator
+
+from ...transports.auth import get_requests_auth
 from .. import events
 from .core import BaseRunner, asgi_test, get_session, network_test, wsgi_test
+
+if TYPE_CHECKING:
+    from .. import events
+    from .context import RunnerContext
 
 
 @dataclass
 class SingleThreadRunner(BaseRunner):
     """Fast runner that runs tests sequentially in the main thread."""
 
-    request_tls_verify: Union[bool, str] = True
-    request_cert: Optional[RequestCert] = None
-
-    def _execute(
-        self, results: TestResultSet, stop_event: threading.Event
-    ) -> Generator[events.ExecutionEvent, None, None]:
-        for event in self._execute_impl(results):
+    def _execute(self, ctx: RunnerContext) -> Generator[events.ExecutionEvent, None, None]:
+        for event in self._execute_impl(ctx):
             yield event
-            if stop_event.is_set() or self._should_stop(event):
+            if ctx.is_stopped or self._should_stop(event):
                 break
 
-    def _execute_impl(self, results: TestResultSet) -> Generator[events.ExecutionEvent, None, None]:
+    def _execute_impl(self, ctx: RunnerContext) -> Generator[events.ExecutionEvent, None, None]:
         auth = get_requests_auth(self.auth, self.auth_type)
         with get_session(auth) as session:
             yield from self._run_tests(
-                self.schema.get_all_tests,
-                network_test,
-                self.hypothesis_settings,
-                self.seed,
+                maker=self.schema.get_all_tests,
+                test_func=network_test,
+                settings=self.hypothesis_settings,
+                generation_config=self.generation_config,
                 checks=self.checks,
                 max_response_time=self.max_response_time,
                 targets=self.targets,
-                results=results,
+                ctx=ctx,
                 session=session,
                 headers=self.headers,
-                request_timeout=self.request_timeout,
-                request_tls_verify=self.request_tls_verify,
-                request_cert=self.request_cert,
+                request_config=self.request_config,
                 store_interactions=self.store_interactions,
                 dry_run=self.dry_run,
             )
@@ -48,16 +44,16 @@ class SingleThreadRunner(BaseRunner):
 
 @dataclass
 class SingleThreadWSGIRunner(SingleThreadRunner):
-    def _execute_impl(self, results: TestResultSet) -> Generator[events.ExecutionEvent, None, None]:
+    def _execute_impl(self, ctx: RunnerContext) -> Generator[events.ExecutionEvent, None, None]:
         yield from self._run_tests(
-            self.schema.get_all_tests,
-            wsgi_test,
-            self.hypothesis_settings,
-            self.seed,
+            maker=self.schema.get_all_tests,
+            test_func=wsgi_test,
+            settings=self.hypothesis_settings,
+            generation_config=self.generation_config,
             checks=self.checks,
             max_response_time=self.max_response_time,
             targets=self.targets,
-            results=results,
+            ctx=ctx,
             auth=self.auth,
             auth_type=self.auth_type,
             headers=self.headers,
@@ -68,16 +64,16 @@ class SingleThreadWSGIRunner(SingleThreadRunner):
 
 @dataclass
 class SingleThreadASGIRunner(SingleThreadRunner):
-    def _execute_impl(self, results: TestResultSet) -> Generator[events.ExecutionEvent, None, None]:
+    def _execute_impl(self, ctx: RunnerContext) -> Generator[events.ExecutionEvent, None, None]:
         yield from self._run_tests(
-            self.schema.get_all_tests,
-            asgi_test,
-            self.hypothesis_settings,
-            self.seed,
+            maker=self.schema.get_all_tests,
+            test_func=asgi_test,
+            settings=self.hypothesis_settings,
+            generation_config=self.generation_config,
             checks=self.checks,
             max_response_time=self.max_response_time,
             targets=self.targets,
-            results=results,
+            ctx=ctx,
             headers=self.headers,
             store_interactions=self.store_interactions,
             dry_run=self.dry_run,

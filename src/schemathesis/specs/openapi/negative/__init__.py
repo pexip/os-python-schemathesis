@@ -1,6 +1,8 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
 import jsonschema
@@ -9,7 +11,10 @@ from hypothesis_jsonschema import from_schema
 
 from ..constants import ALL_KEYWORDS
 from .mutations import MutationContext
-from .types import Draw, Schema
+
+if TYPE_CHECKING:
+    from ....generation import GenerationConfig
+    from .types import Draw, Schema
 
 
 @dataclass
@@ -27,15 +32,15 @@ class CacheKey:
         return hash((self.operation_name, self.location))
 
 
-@lru_cache()
+@lru_cache
 def get_validator(cache_key: CacheKey) -> jsonschema.Draft4Validator:
     """Get JSON Schema validator for the given schema."""
     # Each operation / location combo has only a single schema, therefore could be cached
     return jsonschema.Draft4Validator(cache_key.schema)
 
 
-@lru_cache()
-def split_schema(cache_key: CacheKey) -> Tuple[Schema, Schema]:
+@lru_cache
+def split_schema(cache_key: CacheKey) -> tuple[Schema, Schema]:
     """Split the schema in two parts.
 
     The first one contains only validation JSON Schema keywords, the second one everything else.
@@ -53,9 +58,10 @@ def negative_schema(
     schema: Schema,
     operation_name: str,
     location: str,
-    media_type: Optional[str],
+    media_type: str | None,
+    generation_config: GenerationConfig,
     *,
-    custom_formats: Dict[str, st.SearchStrategy[str]],
+    custom_formats: dict[str, st.SearchStrategy[str]],
 ) -> st.SearchStrategy:
     """A strategy for instances that DO NOT match the input schema.
 
@@ -69,20 +75,22 @@ def negative_schema(
 
     if location == "query":
 
-        def filter_values(value: Dict[str, Any]) -> bool:
+        def filter_values(value: dict[str, Any]) -> bool:
             return is_non_empty_query(value) and not validator.is_valid(value)
 
     else:
 
-        def filter_values(value: Dict[str, Any]) -> bool:
+        def filter_values(value: dict[str, Any]) -> bool:
             return not validator.is_valid(value)
 
     return mutated(keywords, non_keywords, location, media_type).flatmap(
-        lambda s: from_schema(s, custom_formats=custom_formats).filter(filter_values)
+        lambda s: from_schema(
+            s, custom_formats=custom_formats, allow_x00=generation_config.allow_x00, codec=generation_config.codec
+        ).filter(filter_values)
     )
 
 
-def is_non_empty_query(query: Dict[str, Any]) -> bool:
+def is_non_empty_query(query: dict[str, Any]) -> bool:
     # Whether this query parameters will be encoded to a non-empty query string
     result = []
     for key, values in query.items():
@@ -100,7 +108,7 @@ def is_non_empty_query(query: Dict[str, Any]) -> bool:
 
 
 @st.composite  # type: ignore
-def mutated(draw: Draw, keywords: Schema, non_keywords: Schema, location: str, media_type: Optional[str]) -> Any:
+def mutated(draw: Draw, keywords: Schema, non_keywords: Schema, location: str, media_type: str | None) -> Any:
     return MutationContext(
         keywords=keywords, non_keywords=non_keywords, location=location, media_type=media_type
     ).mutate(draw)

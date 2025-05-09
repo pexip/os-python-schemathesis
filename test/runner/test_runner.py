@@ -1,35 +1,40 @@
+from __future__ import annotations
+
 import base64
 import json
 import platform
 from dataclasses import asdict
-from typing import Dict, Optional
+from typing import TYPE_CHECKING
 from unittest.mock import ANY
 
 import hypothesis
 import pytest
 import requests
-from aiohttp import web
 from aiohttp.streams import EmptyStreamReader
 from fastapi import FastAPI
 from flask import Flask
-from hypothesis import Phase
+from hypothesis import Phase, settings
+from hypothesis import strategies as st
 from requests.auth import HTTPDigestAuth
 
 import schemathesis
+from schemathesis import experimental
 from schemathesis._hypothesis import add_examples
+from schemathesis._override import CaseOverride
 from schemathesis.checks import content_type_conformance, response_schema_conformance, status_code_conformance
-from schemathesis.constants import (
-    RECURSIVE_REFERENCE_ERROR_MESSAGE,
-    SCHEMATHESIS_TEST_CASE_HEADER,
-    USER_AGENT,
-    DataGenerationMethod,
-)
+from schemathesis.constants import RECURSIVE_REFERENCE_ERROR_MESSAGE, SCHEMATHESIS_TEST_CASE_HEADER, USER_AGENT
+from schemathesis.generation import DataGenerationMethod, GenerationConfig, HeaderConfig
 from schemathesis.models import Check, Status, TestResult
-from schemathesis.runner import ThreadPoolRunner, events, from_schema, get_requests_auth
+from schemathesis.runner import events, from_schema
 from schemathesis.runner.impl import threadpool
-from schemathesis.runner.impl.core import get_wsgi_auth, has_too_many_responses_with_status, reraise
+from schemathesis.runner.impl.core import deduplicate_errors, has_too_many_responses_with_status
 from schemathesis.specs.graphql import loaders as gql_loaders
 from schemathesis.specs.openapi import loaders as oas_loaders
+from schemathesis.stateful import Stateful
+from schemathesis.transports.auth import get_requests_auth, get_wsgi_auth
+
+if TYPE_CHECKING:
+    from aiohttp import web
 
 
 def execute(schema, **options) -> events.Finished:
@@ -38,7 +43,7 @@ def execute(schema, **options) -> events.Finished:
 
 
 def assert_request(
-    app: web.Application, idx: int, method: str, path: str, headers: Optional[Dict[str, str]] = None
+    app: web.Application, idx: int, method: str, path: str, headers: dict[str, str] | None = None
 ) -> None:
     request = get_incoming_requests(app)[idx]
     assert request.method == method
@@ -114,7 +119,7 @@ def test_execute(any_app, any_app_schema):
     assert stats.total == {"not_a_server_error": {Status.success: 1, Status.failure: 2, "total": 3}}
 
 
-@pytest.mark.parametrize("workers", (1, 2))
+@pytest.mark.parametrize("workers", [1, 2])
 def test_interactions(request, any_app_schema, workers):
     _, *others, _ = from_schema(any_app_schema, workers_num=workers, store_interactions=True).execute()
     base_url = (
@@ -124,15 +129,16 @@ def test_interactions(request, any_app_schema, workers):
     )
 
     # failure
-    interactions = [
+    interactions = next(
         event for event in others if isinstance(event, events.AfterExecution) and event.status == Status.failure
-    ][0].result.interactions
+    ).result.interactions
     assert len(interactions) == 2
     failure = interactions[0]
     assert asdict(failure.request) == {
         "uri": f"{base_url}/failure",
         "method": "GET",
         "body": None,
+        "body_size": None,
         "headers": {
             "Accept": ["*/*"],
             "Accept-Encoding": ["gzip, deflate"],
@@ -147,21 +153,21 @@ def test_interactions(request, any_app_schema, workers):
         assert failure.response.headers == {
             "Content-Type": ["text/html; charset=utf-8"],
             "Content-Length": ["265"],
-            "ETag": ANY,
         }
     else:
         assert failure.response.headers["Content-Type"] == ["text/plain; charset=utf-8"]
         assert failure.response.headers["Content-Length"] == ["26"]
     # success
-    interactions = [
+    interactions = next(
         event for event in others if isinstance(event, events.AfterExecution) and event.status == Status.success
-    ][0].result.interactions
+    ).result.interactions
     assert len(interactions) == 1
     success = interactions[0]
     assert asdict(success.request) == {
         "uri": f"{base_url}/success",
         "method": "GET",
         "body": None,
+        "body_size": None,
         "headers": {
             "Accept": ["*/*"],
             "Accept-Encoding": ["gzip, deflate"],
@@ -175,15 +181,15 @@ def test_interactions(request, any_app_schema, workers):
     assert json.loads(base64.b64decode(success.response.body)) == {"success": True}
     assert success.response.encoding == "utf-8"
     if isinstance(any_app_schema.app, Flask):
-        assert success.response.headers == {"Content-Type": ["application/json"], "Content-Length": ["17"], "ETag": ANY}
+        assert success.response.headers == {"Content-Type": ["application/json"], "Content-Length": ["17"]}
     else:
         assert success.response.headers["Content-Type"] == ["application/json; charset=utf-8"]
 
 
 @pytest.mark.operations("root")
 def test_asgi_interactions(fastapi_app):
-    schema = oas_loaders.from_asgi("/openapi.json", fastapi_app)
-    _, *ev, _ = from_schema(schema, store_interactions=True).execute()
+    schema = oas_loaders.from_asgi("/openapi.json", fastapi_app, force_schema_version="30")
+    _, _, _, _, _, *ev, _ = from_schema(schema, store_interactions=True).execute()
     interaction = ev[1].result.interactions[0]
     assert interaction.status == Status.success
     assert interaction.request.uri == "http://localhost/users"
@@ -193,7 +199,7 @@ def test_asgi_interactions(fastapi_app):
 def test_empty_response_interaction(any_app_schema):
     # When there is a GET request and a response that doesn't return content (e.g. 204)
     _, *others, _ = from_schema(any_app_schema, store_interactions=True).execute()
-    interactions = [event for event in others if isinstance(event, events.AfterExecution)][0].result.interactions
+    interactions = next(event for event in others if isinstance(event, events.AfterExecution)).result.interactions
     for interaction in interactions:  # There could be multiple calls
         # Then the stored request has no body
         assert interaction.request.body is None
@@ -208,7 +214,7 @@ def test_empty_response_interaction(any_app_schema):
 def test_empty_string_response_interaction(any_app_schema):
     # When there is a response that returns payload of length 0
     _, *others, _ = from_schema(any_app_schema, store_interactions=True).execute()
-    interactions = [event for event in others if isinstance(event, events.AfterExecution)][0].result.interactions
+    interactions = next(event for event in others if isinstance(event, events.AfterExecution)).result.interactions
     for interaction in interactions:  # There could be multiple calls
         # Then the stored response body should be an empty string
         assert interaction.response.body == ""
@@ -227,7 +233,7 @@ def test_auth(any_app, any_app_schema):
     assert_request(any_app, 2, "GET", "/api/success", headers)
 
 
-@pytest.mark.parametrize("converter", (lambda x: x, lambda x: x + "/"))
+@pytest.mark.parametrize("converter", [lambda x: x, lambda x: x + "/"])
 def test_base_url(openapi3_base_url, schema_url, app, converter):
     base_url = converter(openapi3_base_url)
     # When `base_url` is specified explicitly with or without trailing slash
@@ -252,11 +258,12 @@ def test_root_url():
     def empty():
         return {}
 
-    def check(response, case):
+    def check(ctx, response, case):
+        assert case.as_transport_kwargs()["url"] == "/"
         assert case.as_requests_kwargs()["url"] == "/"
         assert response.status_code == 200
 
-    schema = oas_loaders.from_asgi("/openapi.json", app=app)
+    schema = oas_loaders.from_asgi("/openapi.json", app=app, force_schema_version="30")
     finished = execute(schema, checks=(check,))
     assert not finished.has_failures
 
@@ -309,15 +316,15 @@ def test_hypothesis_deadline_always_an_error(wsgi_app_schema, flask_app):
     # Then it should always be marked as an error, not a flaky failure
     assert not after.result.is_flaky
     assert after.result.errors
-    assert after.result.errors[0].exception.startswith("DeadlineExceeded: API response time is too slow!")
+    assert after.result.errors[0].exception.startswith("DeadlineExceeded: Test running time is too slow!")
 
 
 @pytest.mark.operations("multipart")
 def test_form_data(any_app, any_app_schema):
-    def is_ok(response, case):
+    def is_ok(ctx, response, case):
         assert response.status_code == 200
 
-    def check_content(response, case):
+    def check_content(ctx, response, case):
         if isinstance(any_app, Flask):
             data = response.json
         else:
@@ -344,7 +351,7 @@ def test_form_data(any_app, any_app_schema):
 
 @pytest.mark.operations("headers")
 def test_headers_override(any_app_schema):
-    def check_headers(response, case):
+    def check_headers(ctx, response, case):
         if isinstance(any_app_schema.app, Flask):
             data = response.json
         else:
@@ -365,7 +372,7 @@ def test_headers_override(any_app_schema):
 def test_unknown_response_code(any_app_schema):
     # When API operation returns a status code, that is not listed in "responses"
     # And "status_code_conformance" is specified
-    _, *others, finished = from_schema(
+    _, _, _, _, _, *others, finished = from_schema(
         any_app_schema,
         checks=(status_code_conformance,),
         hypothesis_settings=hypothesis.settings(max_examples=1, deadline=None),
@@ -384,7 +391,7 @@ def test_unknown_response_code(any_app_schema):
 def test_unknown_response_code_with_default(any_app_schema):
     # When API operation returns a status code, that is not listed in "responses", but there is a "default" response
     # And "status_code_conformance" is specified
-    _, *others, finished = from_schema(
+    _, _, _, _, _, *others, finished = from_schema(
         any_app_schema,
         checks=(status_code_conformance,),
         hypothesis_settings=hypothesis.settings(max_examples=1, deadline=None),
@@ -400,7 +407,7 @@ def test_unknown_response_code_with_default(any_app_schema):
 def test_unknown_content_type(any_app_schema):
     # When API operation returns a response with content type, not specified in "produces"
     # And "content_type_conformance" is specified
-    _, *others, finished = from_schema(
+    _, _, _, _, _, *others, finished = from_schema(
         any_app_schema,
         checks=(content_type_conformance,),
         hypothesis_settings=hypothesis.settings(max_examples=1, deadline=None),
@@ -431,7 +438,7 @@ def test_known_content_type(any_app_schema):
 def test_response_conformance_invalid(any_app_schema):
     # When API operation returns a response that doesn't conform to the schema
     # And "response_schema_conformance" is specified
-    _, *others, finished = from_schema(
+    _, _, _, _, _, *others, finished = from_schema(
         any_app_schema,
         checks=(response_schema_conformance,),
         hypothesis_settings=hypothesis.settings(max_examples=1, deadline=None),
@@ -439,11 +446,31 @@ def test_response_conformance_invalid(any_app_schema):
     # Then there should be a failure
     assert finished.has_failures
     check = others[1].result.checks[-1]
-    lines = check.message.split("\n")
-    assert lines[0] == "The received response does not conform to the defined schema!"
-    assert lines[2] == "Details: "
-    validation_message = "'success' is a required property"
-    assert lines[4] == validation_message
+    assert check.message == "Response violates schema"
+    assert (
+        check.context.message
+        == """'success' is a required property
+
+Schema:
+
+    {
+        "properties": {
+            "success": {
+                "type": "boolean"
+            }
+        },
+        "required": [
+            "success"
+        ],
+        "type": "object"
+    }
+
+Value:
+
+    {
+        "random": "key"
+    }"""
+    )
     assert check.context.instance == {"random": "key"}
     assert check.context.instance_path == []
     assert check.context.schema == {
@@ -452,7 +479,7 @@ def test_response_conformance_invalid(any_app_schema):
         "type": "object",
     }
     assert check.context.schema_path == ["required"]
-    assert check.context.validation_message == validation_message
+    assert check.context.validation_message == "'success' is a required property"
 
 
 @pytest.mark.operations("success")
@@ -501,7 +528,7 @@ def test_response_conformance_text(any_app_schema):
 def test_response_conformance_malformed_json(any_app_schema):
     # When API operation returns a response that contains a malformed JSON, but has a valid content type header
     # And "response_schema_conformance" is specified
-    _, *others, finished = from_schema(
+    _, _, _, _, _, *others, finished = from_schema(
         any_app_schema,
         checks=(response_schema_conformance,),
         hypothesis_settings=hypothesis.settings(max_examples=1, deadline=None),
@@ -510,15 +537,12 @@ def test_response_conformance_malformed_json(any_app_schema):
     assert finished.has_failures
     assert not finished.has_errors
     check = others[1].result.checks[-1]
-    message = check.message
-    assert "The received response is not valid JSON:" in message
-    assert "{malformed}" in message
-    assert "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)" in message
+    assert check.message == "JSON deserialization error"
     assert check.context.validation_message == "Expecting property name enclosed in double quotes"
     assert check.context.position == 1
 
 
-@pytest.fixture()
+@pytest.fixture
 def filter_path_parameters():
     # ".." and "." strings are treated specially, but this behavior is outside the test's scope
     # "" shouldn't be allowed as a valid path parameter
@@ -529,14 +553,13 @@ def filter_path_parameters():
         )
 
     schemathesis.hook(before_generate_path_parameters)
-    yield
-    schemathesis.hooks.unregister_all()
+    return
 
 
 @pytest.mark.operations("path_variable")
 @pytest.mark.usefixtures("filter_path_parameters")
 def test_path_parameters_encoding(real_app_schema):
-    # NOTE. WSGI and ASGI applications decodes %2F as / and returns 404
+    # NOTE. WSGI and ASGI applications decode %2F as / and returns 404
     # When API operation has a path parameter
     results = execute(
         real_app_schema,
@@ -545,16 +568,16 @@ def test_path_parameters_encoding(real_app_schema):
     )
     # Then there should be no failures
     # since all path parameters are quoted
-    assert not results.has_errors
-    assert not results.has_failures
+    assert not results.has_errors, results
+    assert not results.has_failures, results
 
 
 @pytest.mark.parametrize(
-    "loader_options, from_schema_options",
-    (
+    ("loader_options", "from_schema_options"),
+    [
         ({"base_url": "http://127.0.0.1:1/"}, {}),
         ({}, {"hypothesis_settings": hypothesis.settings(deadline=1)}),
-    ),
+    ],
 )
 @pytest.mark.operations("slow")
 def test_exceptions(schema_url, app, loader_options, from_schema_options):
@@ -569,8 +592,7 @@ def test_internal_exceptions(any_app_schema, mocker):
     # When there is an exception during the test
     # And Hypothesis consider this test as a flaky one
     mocker.patch("schemathesis.Case.call", side_effect=ValueError)
-    mocker.patch("schemathesis.Case.call_wsgi", side_effect=ValueError)
-    _, *others, finished = from_schema(
+    _, _, _, _, _, *others, finished = from_schema(
         any_app_schema, hypothesis_settings=hypothesis.settings(max_examples=3, deadline=None)
     ).execute()
     # Then the execution result should indicate errors
@@ -596,6 +618,42 @@ async def test_payload_explicit_example(any_app, any_app_schema):
         body = await incoming_requests[0].json()
     # And this example should be sent to the app
     assert body == {"name": "John"}
+
+
+def test_explicit_examples_from_response(ctx, openapi3_base_url):
+    schema = ctx.openapi.build_schema(
+        {
+            "/items/{itemId}/": {
+                "get": {
+                    "parameters": [{"name": "itemId", "in": "path", "schema": {"type": "string"}, "required": True}],
+                    "responses": {
+                        "200": {
+                            "description": "",
+                            "content": {
+                                "application/json": {
+                                    "schema": {"$ref": "#/components/schemas/Item"},
+                                    "examples": {
+                                        "Example1": {"value": {"id": "123456"}},
+                                        "Example2": {"value": {"itemId": "456789"}},
+                                    },
+                                }
+                            },
+                        }
+                    },
+                }
+            }
+        },
+        components={"schemas": {"Item": {"properties": {"id": {"type": "string"}}}}},
+    )
+    schema = oas_loaders.from_dict(schema, base_url=openapi3_base_url)
+    *_, after, _ = from_schema(
+        schema,
+        hypothesis_settings=hypothesis.settings(max_examples=1, deadline=None, phases=[Phase.explicit]),
+    ).execute()
+    assert [check.example.path_parameters for check in after.result.checks] == [
+        {"itemId": "456789"},
+        {"itemId": "123456"},
+    ]
 
 
 @pytest.mark.operations("payload")
@@ -626,7 +684,7 @@ async def test_explicit_example_disable(any_app, any_app_schema, mocker):
 def test_plain_text_body(any_app, any_app_schema):
     # When the expected payload is text/plain
     # Then the payload is not encoded as JSON
-    def check_content(response, case):
+    def check_content(ctx, response, case):
         if isinstance(any_app, Flask):
             data = response.get_data()
         else:
@@ -654,12 +712,12 @@ def test_invalid_path_parameter(schema_url):
 @pytest.mark.operations("missing_path_parameter")
 def test_missing_path_parameter(any_app_schema):
     # When a path parameter is missing
-    _, *others, finished = from_schema(
+    _, _, _, _, _, *others, finished = from_schema(
         any_app_schema, hypothesis_settings=hypothesis.settings(max_examples=3, deadline=None)
     ).execute()
     # Then it leads to an error
     assert finished.has_errors
-    assert "InvalidSchema: Path parameter 'id' is not defined" in others[1].result.errors[0].exception
+    assert "OperationSchemaError: Path parameter 'id' is not defined" in others[1].result.errors[0].exception
 
 
 def test_get_requests_auth():
@@ -691,20 +749,12 @@ def test_max_failures(any_app_schema):
 @pytest.mark.operations("success")
 def test_workers_num_regression(mocker, real_app_schema):
     # GH: 579
-    spy = mocker.patch("schemathesis.runner.ThreadPoolRunner", wraps=ThreadPoolRunner)
+    spy = mocker.patch("schemathesis.runner.impl.ThreadPoolRunner", wraps=threadpool.ThreadPoolRunner)
     execute(real_app_schema, workers_num=5)
     assert spy.call_args[1]["workers_num"] == 5
 
 
-def test_reraise():
-    try:
-        raise AssertionError("Foo")
-    except AssertionError as exc:
-        error = reraise(exc)
-        assert error.args[0] == "Unknown schema error"
-
-
-@pytest.mark.parametrize("schema_path", ("petstore_v2.yaml", "petstore_v3.yaml"))
+@pytest.mark.parametrize("schema_path", ["petstore_v2.yaml", "petstore_v3.yaml"])
 def test_url_joining(request, server, get_schema_path, schema_path):
     if schema_path == "petstore_v2.yaml":
         base_url = request.getfixturevalue("openapi2_base_url")
@@ -716,10 +766,7 @@ def test_url_joining(request, server, get_schema_path, schema_path):
         schema, hypothesis_settings=hypothesis.settings(max_examples=1, deadline=None)
     ).execute()
     assert after_execution.result.path == "/api/v3/pet/findByStatus"
-    assert (
-        f"http://127.0.0.1:{server['port']}/api/v3/pet/findByStatus"
-        in after_execution.result.checks[0].example.requests_code
-    )
+    assert after_execution.result.checks[0].example.url == f"http://127.0.0.1:{server['port']}/api/v3/pet/findByStatus"
 
 
 @pytest.mark.skipif(platform.system() == "Windows", reason="Fails on Windows due to recursion")
@@ -732,52 +779,203 @@ def test_skip_operations_with_recursive_references(schema_with_recursive_referen
     assert RECURSIVE_REFERENCE_ERROR_MESSAGE in after.result.errors[0].exception
 
 
-def test_unsatisfiable_example(empty_open_api_3_schema):
+@pytest.mark.parametrize(
+    ("phases", "expected", "total_errors"),
+    [
+        ([Phase.explicit, Phase.generate], "Failed to generate test cases for this API operation", 2),
+        ([Phase.explicit], "Failed to generate test cases from examples for this API operation", 1),
+    ],
+)
+def test_unsatisfiable_example(ctx, phases, expected, total_errors):
     # See GH-904
     # When filling missing properties during examples generation leads to unsatisfiable schemas
-    empty_open_api_3_schema["paths"] = {
-        "/success": {
-            "post": {
-                "parameters": [
-                    # This parameter is not satisfiable
-                    {
-                        "name": "key",
-                        "in": "query",
-                        "required": True,
-                        "schema": {"type": "integer", "minimum": 5, "maximum": 4},
-                    }
-                ],
-                "requestBody": {
-                    "content": {
-                        "application/json": {
-                            "schema": {
-                                "type": "object",
-                                "properties": {
-                                    "foo": {"type": "string", "example": "foo example string"},
-                                },
-                            },
+    schema = ctx.openapi.build_schema(
+        {
+            "/success": {
+                "post": {
+                    "parameters": [
+                        # This parameter is not satisfiable
+                        {
+                            "name": "key",
+                            "in": "query",
+                            "required": True,
+                            "schema": {"type": "integer", "minimum": 5, "maximum": 4},
                         }
-                    }
-                },
-                "responses": {"200": {"description": "OK"}},
+                    ],
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "foo": {"type": "string", "example": "foo example string"},
+                                    },
+                                },
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "OK"}},
+                }
             }
         }
-    }
+    )
     # Then the testing process should not raise an internal error
-    schema = oas_loaders.from_dict(empty_open_api_3_schema)
+    schema = oas_loaders.from_dict(schema)
     *_, after, finished = from_schema(
-        schema, hypothesis_settings=hypothesis.settings(max_examples=1, deadline=None)
+        schema, hypothesis_settings=hypothesis.settings(max_examples=1, deadline=None, phases=phases)
     ).execute()
     # And the tests are failing because of the unsatisfiable schema
     assert finished.has_errors
-    assert "Unable to satisfy schema parameters for this API operation" in after.result.errors[0].exception
+    assert expected in after.result.errors[0].exception
+    assert len(after.result.errors) == total_errors
+
+
+@pytest.mark.parametrize(
+    ("phases", "expected"),
+    [
+        ([Phase.explicit, Phase.generate], "Schemathesis can't serialize data to any of the defined media types"),
+        (
+            [Phase.explicit],
+            (
+                "Failed to generate test cases from examples for this API operation because of "
+                "unsupported payload media types"
+            ),
+        ),
+    ],
+)
+def test_non_serializable_example(ctx, phases, expected):
+    # When filling missing request body during examples generation leads to serialization error
+    schema = ctx.openapi.build_schema(
+        {
+            "/success": {
+                "post": {
+                    "parameters": [
+                        {"name": "key", "in": "query", "required": True, "schema": {"type": "integer"}, "example": 42}
+                    ],
+                    "requestBody": {
+                        "content": {
+                            "image/jpeg": {
+                                "schema": {"format": "base64", "type": "string"},
+                            }
+                        }
+                    },
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        }
+    )
+    # Then the testing process should not raise an internal error
+    schema = oas_loaders.from_dict(schema)
+    *_, after, finished = from_schema(
+        schema, hypothesis_settings=hypothesis.settings(max_examples=1, deadline=None, phases=phases)
+    ).execute()
+    # And the tests are failing because of the serialization error
+    assert finished.has_errors
+    assert expected in after.result.errors[0].exception
+    assert len(after.result.errors) == 1
+
+
+@pytest.mark.parametrize(
+    ("phases", "expected"),
+    [
+        (
+            [Phase.explicit, Phase.generate],
+            "Failed to generate test cases for this API operation because of "
+            r"unsupported regular expression `^[\w\s\-\/\pL,.#;:()']+$`",
+        ),
+        (
+            [Phase.explicit],
+            (
+                "Failed to generate test cases from examples for this API operation because of "
+                r"unsupported regular expression `^[\w\s\-\/\pL,.#;:()']+$`"
+            ),
+        ),
+    ],
+)
+def test_invalid_regex_example(ctx, phases, expected):
+    # When filling missing properties during examples generation contains invalid regex
+    schema = ctx.openapi.build_schema(
+        {
+            "/success": {
+                "post": {
+                    "parameters": [
+                        {"name": "key", "in": "query", "required": True, "schema": {"type": "integer"}, "example": 42}
+                    ],
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "properties": {
+                                        "region": {
+                                            "nullable": True,
+                                            "pattern": "^[\\w\\s\\-\\/\\pL,.#;:()']+$",
+                                            "type": "string",
+                                        },
+                                    },
+                                    "required": ["region"],
+                                    "type": "object",
+                                }
+                            }
+                        },
+                        "required": True,
+                    },
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        }
+    )
+    # Then the testing process should not raise an internal error
+    schema = oas_loaders.from_dict(schema)
+    *_, after, finished = from_schema(
+        schema,
+        hypothesis_settings=hypothesis.settings(max_examples=1, deadline=None, phases=phases),
+    ).execute()
+    # And the tests are failing because of the invalid regex error
+    assert finished.has_errors
+    assert expected in after.result.errors[0].exception
+    assert len(after.result.errors) == 1
+
+
+def test_invalid_header_in_example(ctx):
+    schema = ctx.openapi.build_schema(
+        {
+            "/success": {
+                "post": {
+                    "parameters": [
+                        {
+                            "name": "SESSION",
+                            "in": "header",
+                            "required": True,
+                            "schema": {"type": "integer"},
+                            "example": "test\ntest",
+                        }
+                    ],
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        }
+    )
+    # Then the testing process should not raise an internal error
+    schema = oas_loaders.from_dict(schema)
+    *_, after, finished = from_schema(
+        schema,
+        hypothesis_settings=hypothesis.settings(max_examples=1, deadline=None),
+        dry_run=True,
+    ).execute()
+    # And the tests are failing
+    assert finished.has_errors
+    assert (
+        "Failed to generate test cases from examples for this API operation because of some header examples are invalid"
+        in after.result.errors[0].exception
+    )
+    assert len(after.result.errors) == 1
 
 
 @pytest.mark.operations("success")
 def test_dry_run(any_app_schema):
     called = False
 
-    def check(response, case):
+    def check(ctx, response, case):
         nonlocal called
         called = True
 
@@ -791,22 +989,35 @@ def test_dry_run(any_app_schema):
 def test_dry_run_asgi(fastapi_app):
     called = False
 
-    def check(response, case):
+    def check(ctx, response, case):
         nonlocal called
         called = True
 
     # When the user passes `dry_run=True`
-    schema = oas_loaders.from_asgi("/openapi.json", fastapi_app)
+    schema = oas_loaders.from_asgi("/openapi.json", fastapi_app, force_schema_version="30")
     execute(schema, checks=(check,), dry_run=True)
     # Then no requests should be sent & no responses checked
     assert not called
+
+
+def test_connection_error(ctx):
+    schema = ctx.openapi.build_schema({"/success": {"post": {"responses": {"200": {"description": "OK"}}}}})
+    schema = oas_loaders.from_dict(schema, base_url="http://127.0.0.1:1")
+    *_, after, finished = from_schema(
+        schema,
+        hypothesis_settings=hypothesis.settings(max_examples=1, deadline=None),
+    ).execute()
+    # And the tests are failing
+    assert finished.has_errors
+    assert "Max retries exceeded with url" in after.result.errors[0].exception
+    assert len(after.result.errors) == 1
 
 
 @pytest.mark.operations("reserved")
 def test_reserved_characters_in_operation_name(any_app_schema):
     # See GH-992
 
-    def check(response, case):
+    def check(ctx, response, case):
         assert response.status_code == 200
 
     # When there is `:` in the API operation path
@@ -823,37 +1034,46 @@ def test_count_operations(real_app_schema):
     assert event.operations_count is None
 
 
-def test_hypothesis_errors_propagation(empty_open_api_3_schema, openapi3_base_url):
+def test_count_links(real_app_schema):
+    # When `count_links` is set to `False`
+    event = next(from_schema(real_app_schema, count_links=False).execute())
+    # Then the total number of links is not calculated in the `Initialized` event
+    assert event.links_count is None
+
+
+def test_hypothesis_errors_propagation(ctx, openapi3_base_url):
     # See: GH-1046
     # When the operation contains a media type, that Schemathesis can't serialize
     # And there is still a supported media type
-    empty_open_api_3_schema["paths"] = {
-        "/data": {
-            "post": {
-                "requestBody": {
-                    "required": True,
-                    "content": {
-                        # This one is known
-                        "application/json": {
-                            "schema": {
-                                "type": "array",
+    schema = ctx.openapi.build_schema(
+        {
+            "/data": {
+                "post": {
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            # This one is known
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                },
+                            },
+                            # This one is not
+                            "application/xml": {
+                                "schema": {
+                                    "type": "array",
+                                }
                             },
                         },
-                        # This one is not
-                        "application/xml": {
-                            "schema": {
-                                "type": "array",
-                            }
-                        },
                     },
-                },
-                "responses": {"200": {"description": "OK"}},
+                    "responses": {"200": {"description": "OK"}},
+                }
             }
         }
-    }
+    )
 
     max_examples = 10
-    schema = oas_loaders.from_dict(empty_open_api_3_schema, base_url=openapi3_base_url)
+    schema = oas_loaders.from_dict(schema, base_url=openapi3_base_url)
     *_, after, finished = from_schema(
         schema, hypothesis_settings=hypothesis.settings(max_examples=max_examples, deadline=None)
     ).execute()
@@ -865,28 +1085,30 @@ def test_hypothesis_errors_propagation(empty_open_api_3_schema, openapi3_base_ur
     assert not finished.has_errors
 
 
-def test_encoding_octet_stream(empty_open_api_3_schema, openapi3_base_url):
+def test_encoding_octet_stream(ctx, openapi3_base_url):
     # See: GH-1134
     # When the operation contains the `application/octet-stream` media type
     # And has no `format: binary` in its schema
-    empty_open_api_3_schema["paths"] = {
-        "/data": {
-            "post": {
-                "requestBody": {
-                    "required": True,
-                    "content": {
-                        "application/octet-stream": {
-                            "schema": {
-                                "type": "string",
+    schema = ctx.openapi.build_schema(
+        {
+            "/data": {
+                "post": {
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/octet-stream": {
+                                "schema": {
+                                    "type": "string",
+                                },
                             },
                         },
                     },
-                },
-                "responses": {"200": {"description": "OK"}},
+                    "responses": {"200": {"description": "OK"}},
+                }
             }
         }
-    }
-    schema = oas_loaders.from_dict(empty_open_api_3_schema, base_url=openapi3_base_url)
+    )
+    schema = oas_loaders.from_dict(schema, base_url=openapi3_base_url)
     *_, after, finished = from_schema(schema).execute()
     # Then the test outcomes should not contain errors
     # And it should not lead to encoding errors
@@ -897,7 +1119,7 @@ def test_encoding_octet_stream(empty_open_api_3_schema, openapi3_base_url):
 
 def test_graphql(graphql_url):
     schema = gql_loaders.from_url(graphql_url)
-    initialized, *other, finished = list(
+    initialized, _, _, _, _, *other, finished = list(
         from_schema(schema, hypothesis_settings=hypothesis.settings(max_examples=5, deadline=None)).execute()
     )
     assert initialized.operations_count == 4
@@ -912,7 +1134,7 @@ def test_graphql(graphql_url):
 @pytest.mark.operations("success")
 def test_interrupted_in_test(openapi3_schema):
     # When an interrupt happens within a test body (check is called within a test body)
-    def check(response, case):
+    def check(ctx, response, case):
         raise KeyboardInterrupt
 
     *_, event, _ = from_schema(openapi3_schema, checks=(check,)).execute()
@@ -969,6 +1191,10 @@ def test_stop_event_stream_immediately(event_stream):
 
 def test_stop_event_stream_after_second_event(event_stream, workers_num, stop_worker):
     next(event_stream)
+    next(event_stream)
+    next(event_stream)
+    next(event_stream)
+    next(event_stream)
     assert isinstance(next(event_stream), events.BeforeExecution)
     event_stream.stop()
     assert isinstance(next(event_stream), events.Finished)
@@ -989,53 +1215,37 @@ def test_finish(event_stream):
 def test_case_mutation(real_app_schema):
     # When two checks mutate the case
 
-    def check1(response, case):
+    def check1(ctx, response, case):
         case.headers = {"Foo": "BAR"}
         raise AssertionError("Bar!")
 
-    def check2(response, case):
+    def check2(ctx, response, case):
         case.headers = {"Foo": "BAZ"}
         raise AssertionError("Baz!")
 
-    _, _, event, _ = from_schema(real_app_schema, checks=[check1, check2]).execute()
+    *_, event, _ = from_schema(real_app_schema, checks=[check1, check2]).execute()
     # Then these mutations should not interfere
-    assert "Foo: BAR" in event.result.checks[0].example.curl_code
-    assert "Foo: BAZ" in event.result.checks[1].example.curl_code
+    assert event.result.checks[0].example.headers["Foo"] == "BAR"
+    assert event.result.checks[1].example.headers["Foo"] == "BAZ"
 
 
-@pytest.mark.operations("success")
-@pytest.mark.openapi_version("3.0")
-def test_response_mutation(any_app_schema):
-    # When two checks mutate the response
-
-    def check1(response, case):
-        response.request.headers["Foo"] = "BAR"
-        raise AssertionError("Bar!")
-
-    def check2(response, case):
-        response.request.headers["Foo"] = "BAZ"
-        raise AssertionError("Baz!")
-
-    _, _, event, _ = from_schema(any_app_schema, checks=[check1, check2]).execute()
-    # Then these mutations should not interfere
-    assert "Foo: BAR" in event.result.checks[0].example.curl_code
-    assert event.result.checks[0].request.headers["Foo"] == ["BAR"]
-    assert "Foo: BAZ" in event.result.checks[1].example.curl_code
-    assert event.result.checks[1].request.headers["Foo"] == ["BAZ"]
-
-
-def test_malformed_path_template(empty_open_api_3_schema):
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [
+        ("/foo}/", "Single '}' encountered in format string"),
+        ("/{.format}/", "Replacement index 0 out of range for positional args tuple"),
+    ],
+)
+def test_malformed_path_template(ctx, path, expected):
     # When schema contains a malformed path template
-    path = "/foo}/"
-    empty_open_api_3_schema["paths"] = {path: {"get": {"responses": {"200": {"description": "OK"}}}}}
-    schema = schemathesis.from_dict(empty_open_api_3_schema)
+    schema = ctx.openapi.build_schema({path: {"get": {"responses": {"200": {"description": "OK"}}}}})
+    schema = schemathesis.from_dict(schema)
     # Then it should not cause a fatal error
-    _, _, event, _ = list(from_schema(schema).execute())
+    *_, event, _ = list(from_schema(schema).execute())
     assert event.status == Status.error
     # And should produce the proper error message
     assert (
-        event.result.errors[0].exception == f"InvalidSchema: Malformed path template: `{path}`\n\n  "
-        f"Single '}}' encountered in format string\n"
+        event.result.errors[0].exception == f"OperationSchemaError: Malformed path template: `{path}`\n\n  {expected}"
     )
 
 
@@ -1045,7 +1255,6 @@ def result():
         method="POST",
         path="/users/",
         verbose_name="POST /users/",
-        overridden_headers=None,
         data_generation_method=DataGenerationMethod.positive,
     )
 
@@ -1075,25 +1284,27 @@ def test_authorization_warning_missing_threshold(result):
 
 
 @pytest.mark.parametrize(
-    "parameters, expected",
-    (
+    ("parameters", "expected"),
+    [
         ([{"in": "query", "name": "key", "required": True, "schema": {"type": "integer"}}], Status.success),
         ([], Status.skip),
-    ),
+    ],
 )
-def test_explicit_header_negative(empty_open_api_3_schema, parameters, expected):
-    empty_open_api_3_schema["paths"] = {
-        "/test": {
-            "get": {
-                "parameters": parameters,
-                "security": [{"basicAuth": []}],
-                "responses": {"200": {"description": ""}},
+def test_explicit_header_negative(ctx, parameters, expected):
+    schema = ctx.openapi.build_schema(
+        {
+            "/test": {
+                "get": {
+                    "parameters": parameters,
+                    "security": [{"basicAuth": []}],
+                    "responses": {"200": {"description": ""}},
+                }
             }
-        }
-    }
-    empty_open_api_3_schema["components"] = {"securitySchemes": {"basicAuth": {"type": "http", "scheme": "basic"}}}
-    schema = schemathesis.from_dict(empty_open_api_3_schema, data_generation_methods=DataGenerationMethod.negative)
-    _, _, event, finished = list(
+        },
+        components={"securitySchemes": {"basicAuth": {"type": "http", "scheme": "basic"}}},
+    )
+    schema = schemathesis.from_dict(schema, data_generation_methods=DataGenerationMethod.negative)
+    *_, event, finished = list(
         from_schema(
             schema,
             headers={"Authorization": "TEST"},
@@ -1106,17 +1317,19 @@ def test_explicit_header_negative(empty_open_api_3_schema, parameters, expected)
     assert event.status == expected
 
 
-def test_skip_non_negated_headers(empty_open_api_3_schema):
-    empty_open_api_3_schema["paths"] = {
-        "/test": {
-            "get": {
-                "parameters": [{"in": "header", "name": "If-Modified-Since", "schema": {"type": "string"}}],
-                "responses": {"200": {"description": ""}},
+def test_skip_non_negated_headers(ctx):
+    schema = ctx.openapi.build_schema(
+        {
+            "/test": {
+                "get": {
+                    "parameters": [{"in": "header", "name": "If-Modified-Since", "schema": {"type": "string"}}],
+                    "responses": {"200": {"description": ""}},
+                }
             }
         }
-    }
-    schema = schemathesis.from_dict(empty_open_api_3_schema, data_generation_methods=DataGenerationMethod.negative)
-    _, _, event, finished = list(
+    )
+    schema = schemathesis.from_dict(schema, data_generation_methods=DataGenerationMethod.negative)
+    *_, event, finished = list(
         from_schema(
             schema,
             dry_run=True,
@@ -1126,3 +1339,161 @@ def test_skip_non_negated_headers(empty_open_api_3_schema):
     # There should not be unsatisfiable
     assert finished.errored_count == 0
     assert event.status == Status.skip
+
+
+@pytest.mark.parametrize("derandomize", [True, False])
+def test_use_the_same_seed(ctx, derandomize):
+    definition = {"get": {"responses": {"200": {"description": ""}}}}
+    schema = ctx.openapi.build_schema({"/first": definition, "/second": definition})
+    schema = schemathesis.from_dict(schema)
+    after_execution = [
+        event
+        for event in from_schema(
+            schema, dry_run=True, hypothesis_settings=hypothesis.settings(derandomize=derandomize)
+        ).execute()
+        if isinstance(event, events.AfterExecution)
+    ]
+    seed = after_execution[0].result.seed
+    assert all(event.result.seed == seed for event in after_execution)
+
+
+def test_deduplicate_errors():
+    errors = [
+        requests.exceptions.ConnectionError(
+            "HTTPConnectionPool(host='127.0.0.1', port=808): Max retries exceeded with url: /snapshots/uploads/%5Dw2y%C3%9D (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x795a23db4ce0>: Failed to establish a new connection: [Errno 111] Connection refused'))"
+        ),
+        requests.exceptions.ConnectionError(
+            "HTTPConnectionPool(host='127.0.0.1', port=808): Max retries exceeded with url: /snapshots/uploads/%C3%8BEK (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x795a23e2a6c0>: Failed to establish a new connection: [Errno 111] Connection refused'))"
+        ),
+    ]
+    assert len(list(deduplicate_errors(errors))) == 1
+
+
+STATEFUL_KWARGS = {
+    "store_interactions": True,
+    "stateful": Stateful.links,
+    "hypothesis_settings": hypothesis.settings(max_examples=1, deadline=None, stateful_step_count=2),
+}
+
+
+@pytest.mark.openapi_version("3.0")
+@pytest.mark.operations("get_user", "create_user", "update_user")
+def test_stateful_auth(any_app_schema):
+    experimental.STATEFUL_TEST_RUNNER.enable()
+    experimental.STATEFUL_ONLY.enable()
+    _, *_, after_execution, _ = from_schema(any_app_schema, auth=("admin", "password"), **STATEFUL_KWARGS).execute()
+    interactions = after_execution.result.interactions
+    assert len(interactions) > 0
+    for interaction in interactions:
+        assert interaction.request.headers["Authorization"] == ["Basic YWRtaW46cGFzc3dvcmQ="]
+
+
+@pytest.mark.openapi_version("3.0")
+@pytest.mark.operations("get_user", "create_user", "update_user")
+def test_stateful_all_generation_methods(real_app_schema):
+    experimental.STATEFUL_TEST_RUNNER.enable()
+    experimental.STATEFUL_ONLY.enable()
+    method = DataGenerationMethod.negative
+    real_app_schema.data_generation_methods = [method]
+    _, *_, after_execution, _ = from_schema(real_app_schema, **STATEFUL_KWARGS).execute()
+    interactions = after_execution.result.interactions
+    assert len(interactions) > 0
+    for interaction in interactions:
+        for check in interaction.checks:
+            assert check.example.data_generation_method == method.as_short_name()
+
+
+@pytest.mark.openapi_version("3.0")
+@pytest.mark.operations("get_user", "create_user", "update_user")
+def test_stateful_seed(real_app_schema):
+    experimental.STATEFUL_TEST_RUNNER.enable()
+    experimental.STATEFUL_ONLY.enable()
+    requests = []
+    for _ in range(3):
+        _, *_, after_execution, _ = from_schema(real_app_schema, seed=42, **STATEFUL_KWARGS).execute()
+        current = []
+        for interaction in after_execution.result.interactions:
+            data = interaction.request.__dict__
+            del data["headers"][SCHEMATHESIS_TEST_CASE_HEADER]
+            current.append(data)
+        requests.append(current)
+    assert requests[0][0] == requests[1][0] == requests[2][0]
+
+
+@pytest.mark.openapi_version("3.0")
+@pytest.mark.operations("get_user", "create_user", "update_user")
+def test_stateful_override(real_app_schema):
+    experimental.STATEFUL_TEST_RUNNER.enable()
+    experimental.STATEFUL_ONLY.enable()
+    _, *_, after_execution, _ = from_schema(
+        real_app_schema,
+        override=CaseOverride(path_parameters={"user_id": "42"}, headers={}, query={}, cookies={}),
+        hypothesis_settings=hypothesis.settings(max_examples=40, deadline=None, stateful_step_count=2),
+        store_interactions=True,
+        stateful=Stateful.links,
+    ).execute()
+    interactions = after_execution.result.interactions
+    assert len(interactions) > 0
+    get_requests = [i.request for i in interactions if i.request.method == "GET"]
+    assert len(get_requests) > 0
+    for request in get_requests:
+        assert "/api/users/42?" in request.uri
+
+
+@pytest.mark.openapi_version("3.0")
+@pytest.mark.operations("failure", "get_user", "create_user", "update_user")
+def test_stateful_exit_first(real_app_schema):
+    experimental.STATEFUL_TEST_RUNNER.enable()
+    _, *ev, _ = from_schema(real_app_schema, exit_first=True, **STATEFUL_KWARGS).execute()
+    assert not any(isinstance(event, events.StatefulEvent) for event in ev)
+
+
+def test_generation_config_in_explicit_examples(ctx, openapi2_base_url):
+    schema = ctx.openapi.build_schema(
+        {
+            "/what": {
+                "post": {
+                    "parameters": [
+                        {
+                            "in": "header",
+                            "name": "X-VO-Api-Id",
+                            "required": True,
+                            "type": "string",
+                        },
+                        {
+                            "in": "body",
+                            "name": "body",
+                            "required": True,
+                            "schema": {
+                                "properties": {
+                                    "type": {
+                                        "example": "email",
+                                        "type": "string",
+                                    },
+                                },
+                                "type": "object",
+                            },
+                        },
+                    ],
+                    "responses": {"200": {"description": "Ok"}},
+                }
+            },
+        },
+        version="2.0",
+    )
+    schema = schemathesis.from_dict(schema, base_url=openapi2_base_url)
+    runner = schemathesis.runner.from_schema(
+        schema,
+        hypothesis_settings=settings(max_examples=10),
+        generation_config=GenerationConfig(
+            with_security_parameters=False,
+            headers=HeaderConfig(strategy=st.text(alphabet=st.characters(whitelist_characters="a", categories=()))),
+        ),
+    )
+    for event in runner.execute():
+        if isinstance(event, events.AfterExecution):
+            for check in event.result.checks:
+                for header in check.example.headers.values():
+                    if header:
+                        assert set(header) == {"a"}
+            break

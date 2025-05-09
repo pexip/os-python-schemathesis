@@ -1,9 +1,15 @@
-from enum import Enum
-from typing import Any, List, NoReturn, Optional, Set, Tuple, Type, Union
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import click
 
-from ..types import NotSet
+from ..constants import NOT_SET
+
+if TYPE_CHECKING:
+    from enum import Enum
+
+    from ..types import NotSet
 
 
 class CustomHelpMessageChoice(click.Choice):
@@ -18,26 +24,31 @@ class CustomHelpMessageChoice(click.Choice):
 
 
 class BaseCsvChoice(click.Choice):
-    def parse_value(self, value: str) -> Tuple[List[str], Set[str]]:
+    def parse_value(self, value: str) -> tuple[list[str], set[str]]:
         selected = [item for item in value.split(",") if item]
-        invalid_options = set(selected) - set(self.choices)
+        if not self.case_sensitive:
+            invalid_options = {
+                item for item in selected if item.upper() not in {choice.upper() for choice in self.choices}
+            }
+        else:
+            invalid_options = set(selected) - set(self.choices)
         return selected, invalid_options
 
-    def fail_on_invalid_options(self, invalid_options: Set[str], selected: List[str]) -> NoReturn:
+    def fail_on_invalid_options(self, invalid_options: set[str], selected: list[str]) -> NoReturn:
         # Sort to keep the error output consistent with the passed values
         sorted_options = ", ".join(sorted(invalid_options, key=selected.index))
         available_options = ", ".join(self.choices)
-        self.fail(f"invalid choice(s): {sorted_options}. Choose from {available_options}")
+        self.fail(f"invalid choice(s): {sorted_options}. Choose from {available_options}.")
 
 
 class CsvEnumChoice(BaseCsvChoice):
-    def __init__(self, choices: Type[Enum]):
+    def __init__(self, choices: type[Enum]):
         self.enum = choices
         super().__init__(tuple(el.name for el in choices))
 
     def convert(  # type: ignore[return]
-        self, value: str, param: Optional[click.core.Parameter], ctx: Optional[click.core.Context]
-    ) -> List[Enum]:
+        self, value: str, param: click.core.Parameter | None, ctx: click.core.Context | None
+    ) -> list[Enum]:
         selected, invalid_options = self.parse_value(value)
         if not invalid_options and selected:
             return [self.enum[item] for item in selected]
@@ -45,26 +56,28 @@ class CsvEnumChoice(BaseCsvChoice):
 
 
 class CsvChoice(BaseCsvChoice):
-    def convert(
-        self, value: str, param: Optional[click.core.Parameter], ctx: Optional[click.core.Context]
-    ) -> List[str]:
+    def convert(self, value: str, param: click.core.Parameter | None, ctx: click.core.Context | None) -> list[str]:
         selected, invalid_options = self.parse_value(value)
         if not invalid_options and selected:
             return selected
         self.fail_on_invalid_options(invalid_options, selected)
 
 
-not_set = NotSet()
+class CsvListChoice(click.ParamType):
+    def convert(  # type: ignore[return]
+        self, value: str, param: click.core.Parameter | None, ctx: click.core.Context | None
+    ) -> list[str]:
+        return [item for item in value.split(",") if item]
 
 
 class OptionalInt(click.types.IntRange):
     def convert(  # type: ignore
-        self, value: str, param: Optional[click.core.Parameter], ctx: Optional[click.core.Context]
-    ) -> Union[int, NotSet]:
+        self, value: str, param: click.core.Parameter | None, ctx: click.core.Context | None
+    ) -> int | NotSet:
         if value.lower() == "none":
-            return not_set
+            return NOT_SET
         try:
             int(value)
             return super().convert(value, param, ctx)
         except ValueError:
-            self.fail("%s is not a valid integer or None" % value, param, ctx)
+            self.fail(f"{value} is not a valid integer or None.", param, ctx)

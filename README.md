@@ -1,8 +1,4 @@
 <p align="center">
-    <em>Discover API-breaking payloads, keep API documentation up-to-date, and increase confidence in your API</em>
-</p>
-
-<p align="center">
     <a href="https://github.com/schemathesis/schemathesis/actions" target="_blank">
         <img src="https://github.com/schemathesis/schemathesis/actions/workflows/build.yml/badge.svg" alt="Build">
     </a>
@@ -23,33 +19,117 @@
     </a>
 </p>
 
----
+## Schemathesis
 
-**Documentation**: <a href="https://schemathesis.readthedocs.io/en/stable/" target="_blank">https://schemathesis.readthedocs.io/en/stable/ </a>
+Schemathesis is an API testing tool that automatically finds crashes and validates spec compliance.
 
-**Chat**: <a href="https://discord.gg/R9ASRAmHnA" target="_blank">https://discord.gg/R9ASRAmHnA </a>
+<p align="center">
+  <img src="https://raw.githubusercontent.com/schemathesis/schemathesis/master/img/demo.gif" alt="Schemathesis Demo"/>
+</p>
 
----
+<p align="center">
+  <i>Finding server crashes in the Demo API.</i>
+</p>
 
-Schemathesis is a specification-based testing tool for OpenAPI and GraphQL apps based on the powerful <a href="https://hypothesis.works/" target="_blank">Hypothesis</a> framework.
+### Highlights
 
-Here are the key features:
+🎯 **Catches Hard-to-Find Bugs**
 
-- **OpenAPI & GraphQL**: Test a wide range of APIs with ease, regardless of the specification used.
-- **Positive & Negative Tests**: Ensure your API handles valid and invalid inputs, incl. unexpected ones.
-- **Stateful Testing**: Automatically generate sequences of API
-  requests where subsequent requests build on previous ones for
-  testing complex and interdependent scenarios.
-- **Session Replay**: Quickly store and replay test sessions to easily investigate and resolve issues.
-- **Targeted Testing**: Guide data generation towards specific metrics
-  like response time or size. Uncover performance or resource usage
-  issues and optimize API behavior under different conditions.
-- **Python Integration**: Utilize native ASGI/WSGI support for faster testing your Python applications.
-- **Customization**: Tune data generation, API response verification, and testing process to fit your needs.
-- **CI Integration**: Run tests on every code change with Docker image
-  and [GitHub Action](https://github.com/schemathesis/action).
-- **SaaS Platform**: Leverage an all-in-one solution with no setup or installation required.
-- **Commercial Support**: Benefit from prompt, professional guidance to maintain an optimal testing workflow.
+- Uncover hidden crashes and edge cases that manual testing might miss
+- Identify spec violations and ensure your API adheres to its contract
+
+⚡ **Accelerates Testing Cycles**
+
+- Automatically generate a wide range of test cases based on your API schema
+- Save time by reducing the need for manual test case creation
+
+🧩 **Integrates Seamlessly**
+
+- Works with popular API formats such as OpenAPI, GraphQL.
+- Easily integrate into your existing CI/CD workflows.
+
+🔧 **Customizable and Extendable**
+
+- Tune the testing process using Python extensions.
+- Adjust the testing flow to suit your needs with rich configuration options.
+
+🐞 **Simplifies Debugging**
+
+- Get detailed reports to identify and fix issues quickly.
+- Reproduce failing test cases with cURL commands.
+
+🔬 **Proven by Research**
+
+- Validated through academic studies on API testing automation
+- Featured in [ICSE 2022 paper](https://ieeexplore.ieee.org/document/9793781) on semantics-aware fuzzing
+- Recognized in [ACM survey](https://dl.acm.org/doi/10.1145/3617175) as state-of-the-art RESTful API testing tool
+
+## Installation
+
+Use Schemathesis via Docker, or install it from [PyPI](https://pypi.org/project/schemathesis/)
+
+```console
+# Via Docker.
+$ docker pull schemathesis/schemathesis:stable
+
+# With pip.
+$ pip install schemathesis
+```
+
+## Getting Started
+
+Schemathesis works as a standalone CLI:
+
+```console
+docker run schemathesis/schemathesis:stable
+   run --checks all https://example.schemathesis.io/openapi.json
+# Or when installed with pip
+schemathesis run --checks all https://example.schemathesis.io/openapi.json
+```
+
+Or a Python library:
+
+```python
+import schemathesis
+
+schema = schemathesis.from_uri("https://example.schemathesis.io/openapi.json")
+
+
+@schema.parametrize()
+def test_api(case):
+    case.call_and_validate()
+```
+
+See a complete working example project in the [/example](https://github.com/schemathesis/schemathesis/tree/master/example) directory.
+
+Schemathesis can be easily integrated into your CI/CD pipeline using GitHub Actions. Add this block to your GitHub Actions to run Schemathesis against your API:
+
+```yaml
+api-tests:
+  runs-on: ubuntu-latest
+  steps:
+    - uses: schemathesis/action@v1
+      with:
+        schema: "https://example.schemathesis.io/openapi.json"
+```
+
+For more details, check out our [GitHub Action](https://github.com/schemathesis/action) repository.
+
+## Who's Using Schemathesis?
+
+Schemathesis is used by a number of projects and companies, including direct usage or integration into other tools:
+
+- Abstract Machines ([Magistrala](https://github.com/absmach/magistrala))
+- Bundesstelle für Open Data ([smard-api](https://github.com/bundesAPI/smard-api))
+- [CheckMK](https://github.com/Checkmk/checkmk)
+- Chronosphere.io ([Calyptia](https://github.com/chronosphereio/calyptia-api))
+- HXSecurity ([DongTai](https://github.com/HXSecurity/DongTai))
+- Netflix ([Dispatch](https://github.com/Netflix/dispatch))
+- [Pixie](https://github.com/pixie-io/pixie)
+- [Qdrant](https://github.com/qdrant/qdrant)
+- Spotify ([Backstage](https://github.com/backstage/backstage))
+- [Weechat](https://github.com/weechat/weechat)
+- WordPress ([OpenVerse](https://github.com/WordPress/openverse))
 
 ## Testimonials
 
@@ -77,140 +157,36 @@ Here are the key features:
 
 ---
 
-## How does it work?
+"_There are different levels of usability and documentation quality among these tools which have been reported, where Schemathesis clearly stands out among the most user-friendly and industry-strength tools._"
 
-Schemathesis uses your API's schema to generate both valid and invalid
-test scenarios, helping you verify API compliance and catch potential
-issues. It also verifies examples from the schema itself.
+<div>Testing RESTful APIs: A Survey - <strong>a research paper by Golmohammadi, at al</strong></div>
 
-Schemathesis generates high quality, diverse test data based on novel
-techniques like [Swarm
-testing](https://dl.acm.org/doi/10.1145/2338965.2336763) or [Schema
-fuzzing](https://patricegodefroid.github.io/public_psfiles/fse2020.pdf),
-ensuring that your API is thoroughly tested and even the most elusive
-bugs are uncovered.
-
-It's a versatile tool that works with any language, as long as you have
-an API schema in a supported format.
-
-Learn more about how it works in our [research
-paper](https://arxiv.org/abs/2112.10328).
-
-## Why use Schemathesis?
-
-1. **Avoid Crashes**: Discover API-breaking payloads and avoid crashes, database corruption, and hangs.
-2. **Keep API Documentation Up-to-Date**: With Schemathesis, you never have to worry about API consumers using outdated specifications or incorrect payload examples.
-3. **Easy Debugging**: Schemathesis provides you with a detailed failure report, along with a single cURL command to help you reproduce the problem instantly.
-4. **Increased Confidence in API Stability**: By thoroughly testing your API with Schemathesis, you can have peace of mind knowing that your API is functioning as intended.
-5. **Thorough Testing Coverage**: Schemathesis generates a large number of scenarios to test your API against, giving you a comprehensive view of its behavior and potential issues.
-6. **Time-Saving**: Schemathesis streamlines API testing, saving your time for other tasks.
-
-## Getting started
-
-Schemathesis can be used as a CLI, a Python library, a [GitHub app](https://github.com/apps/schemathesis), or as a [SaaS](https://schemathesis.io/?utm_source=github).
-
-- **CLI**: Quick and easy way to get started, for those who prefer the command line.
-- **Python Library**: More control and customization, for developers integrating with their codebase.
-- **GitHub App**: Direct testing in your GitHub repositories with reports in your pull requests.
-- **SaaS**: No setup or installation, if you prefer an all-in-one solution with great visuals. Free tier included.
-
-## Installation
-
-```bash
-python -m pip install schemathesis
-```
-
-This command installs the `st` entrypoint.
-
-You can also use our Docker image without installing Schemathesis as a Python package:
-
-```bash
-docker pull schemathesis/schemathesis:stable
-```
-
-If you use GitHub, there is a native [GitHub app](https://github.com/apps/schemathesis) that reports test results directly to your pull requests.
-
-## Example
-
-### GitHub Actions
-
-```yaml
-api-tests:
-  runs-on: ubuntu-20.04
-  steps:
-    # Runs Schemathesis tests with all checks enabled
-    - uses: schemathesis/action@v1
-      with:
-        # Your API schema location
-        schema: "http://localhost:5000/api/openapi.json"
-        # OPTIONAL. Your Schemathesis.io token
-        token: ${{ secrets.SCHEMATHESIS_TOKEN }}
-```
-
-Check our [GitHub Action](https://github.com/schemathesis/action) for more details.
-
-### Command line
-
-```bash
-st run --checks all https://example.schemathesis.io/openapi.json
-
-# Or
-
-docker run schemathesis/schemathesis:stable \
-   run --checks all https://example.schemathesis.io/openapi.json
-```
-
-![image](https://raw.githubusercontent.com/schemathesis/schemathesis/master/img/demo.gif)
-
-### Python tests
-
-```python
-import schemathesis
-
-schema = schemathesis.from_uri("https://example.schemathesis.io/openapi.json")
-
-
-@schema.parametrize()
-def test_api(case):
-    case.call_and_validate()
-```
-
-Choose CLI for simplicity or Python package for greater flexibility. Both options run extensive tests and report failures with reproduction instructions.
-
-💡 See a complete working example project in the [/example](https://github.com/schemathesis/schemathesis/tree/master/example) directory.💡
-
-## Let's make it better together 🤝
-
-We're always looking to make Schemathesis better, and your feedback is
-a crucial part of that journey! If you've got a few minutes, we'd love
-to hear your thoughts on your experience using Schemathesis.
-
-Just follow [this link](https://forms.gle/kJ4hSxc1Yp6Ga96t5) to let us know what you think 💬
-
-Thanks for helping us make Schemathesis even better! 👍
-
-## Commercial support
-
-For assistance with integrating Schemathesis into your company workflows or improving its effectiveness, reach out to our support team at <a href="mailto:support@schemathesis.io">support@schemathesis.io</a>.
-Additionally, we offer commercial support for those looking for extra assurance and priority assistance.
+---
 
 ## Contributing
 
-Any contribution to development, testing, or any other area is highly
-appreciated and useful to the project. For guidance on how to contribute
-to Schemathesis, see the [contributing guidelines](https://github.com/schemathesis/schemathesis/blob/master/CONTRIBUTING.rst).
+We welcome contributions in code and are especially interested in learning about your use cases. Your input is essential for improving Schemathesis and directly influences future updates.
 
-## Additional content
+### How to Contribute
 
-- [Deriving Semantics-Aware Fuzzers from Web API Schemas](https://arxiv.org/abs/2112.10328) by **@Zac-HD** and **@Stranger6667**
-- [An article](https://dygalo.dev/blog/schemathesis-property-based-testing-for-api-schemas/) about Schemathesis by **@Stranger6667**
-- [Effective API schemas testing](https://youtu.be/VVLZ25JgjD4) from DevConf.cz by **@Stranger6667**
-- [How to use Schemathesis to test Flask API in GitHub Actions](https://notes.lina-is-here.com/2022/08/04/schemathesis-docker-compose.html) by **@lina-is-here**
-- [Testing APIFlask with schemathesis](http://blog.pamelafox.org/2023/02/testing-apiflask-with-schemathesis.html) by **@pamelafox**
-- [A video](https://www.youtube.com/watch?v=9FHRwrv-xuQ) from EuroPython 2020 by **@hultner**
-- [Schemathesis tutorial](https://appdev.consulting.redhat.com/tracks/contract-first/automated-testing-with-schemathesis.html) with an accompanying [video](https://www.youtube.com/watch?v=4r7OC-lBKMg) by Red Hat
-- [Using Hypothesis and Schemathesis to Test FastAPI](https://testdriven.io/blog/fastapi-hypothesis/) by **@amalshaji**
-- [A tutorial](https://habr.com/ru/company/oleg-bunin/blog/576496/) (RUS) about Schemathesis by **@Stranger6667**
+1. Discuss ideas and questions through [GitHub issues](https://github.com/schemathesis/schemathesis/issues) or on our [Discord channel](https://discord.gg/R9ASRAmHnA).
+2. For code contributions, see our [contributing guidelines](https://github.com/schemathesis/schemathesis/blob/master/CONTRIBUTING.rst).
+3. Share your experience and thoughts using [this feedback form](https://forms.gle/kJ4hSxc1Yp6Ga96t5).
+
+### Why Your Input Matters
+
+- Enables us to develop useful features and fix bugs faster
+- Improves our test suite and documentation
+
+Thank you for contributing to making Schemathesis better! 👍
+
+## Get in Touch
+
+If you need assistance with integrating Schemathesis into your workflows or have specific questions, feel free to reach out at <a href="mailto:support@schemathesis.io">support@schemathesis.io</a>.
+
+## Acknowledgements
+
+Schemathesis is built on top of <a href="https://hypothesis.works/" target="_blank">Hypothesis</a>, a powerful property-based testing library for Python.
 
 ## License
 

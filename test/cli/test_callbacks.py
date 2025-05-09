@@ -2,17 +2,17 @@ from types import SimpleNamespace
 
 import click
 import pytest
-from hypothesis import example, given
+from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
-from schemathesis import utils
 from schemathesis.cli import callbacks
 from schemathesis.cli.callbacks import SchemaInputKind
+from schemathesis.transports.headers import is_latin_1_encodable
 
 from ..utils import SIMPLE_PATH
 
 
-@pytest.mark.parametrize("value", ("//test", "//ÿ["))
+@pytest.mark.parametrize("value", ["//test", "//ÿ["])
 def test_parse_schema_kind(value):
     with pytest.raises(click.UsageError):
         kind = callbacks.parse_schema_kind(value, app=None)
@@ -30,12 +30,14 @@ def test_validate_schema_path_without_base_url():
 @example(":")
 @example("0:Ā")
 @example("Ā:0")
+@settings(deadline=None)
 def test_validate_auth(value):
     with pytest.raises(click.BadParameter):
         callbacks.validate_auth(None, None, value)
 
 
 @given(value=st.text())
+@settings(deadline=None)
 def test_validate_app(value):
     with pytest.raises(click.exceptions.Exit):
         callbacks.validate_app(SimpleNamespace(params={"show_errors_tracebacks": False}), None, value)
@@ -45,7 +47,7 @@ def is_invalid_header(header):
     try:
         # We need to avoid generating known valid headers
         key, _ = header.split(":", maxsplit=1)
-        return not (key.strip() and utils.is_latin_1_encodable(key))
+        return not (key.strip() and is_latin_1_encodable(key))
     except ValueError:
         return True
 
@@ -55,20 +57,21 @@ def is_invalid_header(header):
 @example(("0:Ā",))
 @example(("Ā:0",))
 @example((" :test",))
+@settings(deadline=None)
 def test_validate_header(value):
     with pytest.raises(click.BadParameter):
         callbacks.validate_headers(None, None, value)
 
 
 def test_reraise_format_error():
-    with pytest.raises(click.BadParameter, match="Should be in KEY:VALUE format. Got: bla"):
+    with pytest.raises(click.BadParameter, match="Expected KEY:VALUE format, received bla."):
         with callbacks.reraise_format_error("bla"):
             raise ValueError
 
 
 @pytest.mark.parametrize(
     "value",
-    ("+", "\\", "[", r"0EEE|[>:>\UEEEEEEEEEEEEEEEEEEEEEEEE>", "(?(8))"),
+    ["+", "\\", "[", r"0EEE|[>:>\UEEEEEEEEEEEEEEEEEEEEEEEE>", "(?(8))"],
 )
 def test_validate_regex(value):
     with pytest.raises(click.BadParameter, match="Invalid regex: "):
@@ -76,23 +79,23 @@ def test_validate_regex(value):
 
 
 @pytest.mark.parametrize(
-    "value, expected",
-    (
+    ("value", "expected"),
+    [
         ("On", True),
         ("F", False),
         ("/tmp/cert.pem", "/tmp/cert.pem"),
-    ),
+    ],
 )
 def test_convert_request_tls_verify(value, expected):
     assert callbacks.convert_boolean_string(None, None, value) == expected
 
 
-@pytest.mark.parametrize("value, expected", (("2", 2), ("auto", callbacks.get_workers_count())))
+@pytest.mark.parametrize(("value", "expected"), [("2", 2), ("auto", callbacks.get_workers_count())])
 def test_convert_workers(value, expected):
     assert callbacks.convert_workers(None, None, value) == expected
 
 
-@pytest.mark.parametrize("value", ("1", "1/g", "f/g"))
+@pytest.mark.parametrize("value", ["1", "1/g", "f/g"])
 def test_validate_rate_limit_invalid(value):
     with pytest.raises(click.UsageError) as exc:
         callbacks.validate_rate_limit(None, None, value)
@@ -104,3 +107,35 @@ def test_validate_rate_limit_invalid(value):
 
 def test_validate_rate_limit_valid():
     assert callbacks.validate_rate_limit(None, None, "10/m") == "10/m"
+
+
+@pytest.mark.parametrize(
+    ("input_codes", "output", "error"),
+    [
+        (["200", "404"], ["200", "404"], None),
+        (["2xx", "4xx"], ["2xx", "4xx"], None),
+        (["200", "2xx", "404", "4xx"], ["200", "2xx", "404", "4xx"], None),
+        ([], [], None),
+        (["200", "600"], None, "Invalid status code(s): 600"),
+        (["2xx", "6xx"], None, "Invalid status code(s): 6xx"),
+        (["2xx", "xxx"], None, "Invalid status code(s): xxx"),
+        (["2xx", "999"], None, "Invalid status code(s): 999"),
+        (["200", "abc"], None, "Invalid status code(s): abc"),
+        (["200", "2bc"], None, "Invalid status code(s): 2bc"),
+        (["200", "2Xc"], None, "Invalid status code(s): 2Xc"),
+        (["200", "20"], None, "Invalid status code(s): 20"),
+        (["200", "2xxx"], None, "Invalid status code(s): 2xxx"),
+        (["200", "xx"], None, "Invalid status code(s): xx"),
+    ],
+)
+def test_convert_status_codes(input_codes, output, error):
+    if error:
+        with pytest.raises(click.UsageError) as excinfo:
+            callbacks.convert_status_codes(None, None, input_codes)
+        assert error in str(excinfo.value)
+    else:
+        assert callbacks.convert_status_codes(None, None, input_codes) == output
+
+
+def test_convert_status_codes_empty_input():
+    assert callbacks.convert_status_codes(None, None, None) is None

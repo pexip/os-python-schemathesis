@@ -1,13 +1,18 @@
 """Expression nodes description and evaluation logic."""
+
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum, unique
-from typing import Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 from requests.structures import CaseInsensitiveDict
 
-from ....utils import WSGIResponse
 from .. import references
-from .context import ExpressionContext
+
+if TYPE_CHECKING:
+    from .context import ExpressionContext
+    from .extractors import Extractor
 
 
 @dataclass
@@ -73,29 +78,38 @@ class NonBodyRequest(Node):
 
     location: str
     parameter: str
+    extractor: Extractor | None = None
 
     def evaluate(self, context: ExpressionContext) -> str:
-        container: Union[Dict, CaseInsensitiveDict] = {
+        container: dict | CaseInsensitiveDict = {
             "query": context.case.query,
             "path": context.case.path_parameters,
             "header": context.case.headers,
         }[self.location] or {}
         if self.location == "header":
             container = CaseInsensitiveDict(container)
-        return container[self.parameter]
+        value = container.get(self.parameter)
+        if value is None:
+            return ""
+        if self.extractor is not None:
+            return self.extractor.extract(value) or ""
+        return value
 
 
 @dataclass
 class BodyRequest(Node):
     """A node for `$request` expressions where location is `body`."""
 
-    pointer: Optional[str] = None
+    pointer: str | None = None
 
     def evaluate(self, context: ExpressionContext) -> Any:
         document = context.case.body
         if self.pointer is None:
             return document
-        return references.resolve_pointer(document, self.pointer[1:])
+        resolved = references.resolve_pointer(document, self.pointer[1:])
+        if resolved is references.UNRESOLVABLE:
+            return None
+        return resolved
 
 
 @dataclass
@@ -103,18 +117,26 @@ class HeaderResponse(Node):
     """A node for `$response.header` expressions."""
 
     parameter: str
+    extractor: Extractor | None = None
 
     def evaluate(self, context: ExpressionContext) -> str:
-        return context.response.headers[self.parameter]
+        value = context.response.headers.get(self.parameter)
+        if value is None:
+            return ""
+        if self.extractor is not None:
+            return self.extractor.extract(value) or ""
+        return value
 
 
 @dataclass
 class BodyResponse(Node):
     """A node for `$response.body` expressions."""
 
-    pointer: Optional[str] = None
+    pointer: str | None = None
 
     def evaluate(self, context: ExpressionContext) -> Any:
+        from ....transports.responses import WSGIResponse
+
         if isinstance(context.response, WSGIResponse):
             document = context.response.json
         else:
@@ -122,4 +144,7 @@ class BodyResponse(Node):
         if self.pointer is None:
             # We need the parsed document - data will be serialized before sending to the application
             return document
-        return references.resolve_pointer(document, self.pointer[1:])
+        resolved = references.resolve_pointer(document, self.pointer[1:])
+        if resolved is references.UNRESOLVABLE:
+            return None
+        return resolved

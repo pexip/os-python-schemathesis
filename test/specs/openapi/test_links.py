@@ -40,7 +40,7 @@ LINK = Link(
 
 @pytest.fixture(scope="module")
 def case():
-    return Case(API_OPERATION)
+    return Case(API_OPERATION, generation_time=0.0)
 
 
 @pytest.fixture(scope="module")
@@ -53,8 +53,8 @@ def response():
 
 
 @pytest.mark.parametrize(
-    "url, expected",
-    (
+    ("url", "expected"),
+    [
         (
             "/users/",
             [
@@ -80,7 +80,7 @@ def response():
             ],
         ),
         ("/unknown", []),
-    ),
+    ],
 )
 @pytest.mark.operations("create_user", "get_user", "update_user")
 def test_get_links(openapi3_base_url, schema_url, url, expected):
@@ -93,57 +93,59 @@ def test_get_links(openapi3_base_url, schema_url, url, expected):
         assert test.parameters == value.parameters
 
 
-def test_response_type(case, empty_open_api_3_schema):
+def test_response_type(ctx, case):
     # See GH-1068
     # When runtime expression for `requestBody` contains a reference to the whole body
-    empty_open_api_3_schema["paths"] = {
-        "/users/{user_id}/": {
-            "get": {
-                "operationId": "getUser",
-                "parameters": [
-                    {"in": "query", "name": "user_id", "required": True, "schema": {"type": "string"}},
-                ],
-                "responses": {
-                    "200": {
-                        "description": "OK",
-                        "links": {
-                            "UpdateUserById": {
-                                "operationRef": "#/paths/~1users~1{user_id}~1/patch",
-                                "parameters": {"user_id": "$response.body#/id"},
-                                "requestBody": "$response.body",
+    schema = ctx.openapi.build_schema(
+        {
+            "/users/{user_id}/": {
+                "get": {
+                    "operationId": "getUser",
+                    "parameters": [
+                        {"in": "query", "name": "user_id", "required": True, "schema": {"type": "string"}},
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "OK",
+                            "links": {
+                                "UpdateUserById": {
+                                    "operationRef": "#/paths/~1users~1{user_id}~1/patch",
+                                    "parameters": {"user_id": "$response.body#/id"},
+                                    "requestBody": "$response.body",
+                                }
+                            },
+                        },
+                        "404": {"description": "Not found"},
+                    },
+                },
+                "patch": {
+                    "operationId": "updateUser",
+                    "parameters": [
+                        {"in": "query", "name": "user_id", "required": True, "schema": {"type": "string"}},
+                    ],
+                    "requestBody": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string", "minLength": 3},
+                                        "first_name": {"type": "string", "minLength": 3},
+                                        "last_name": {"type": "string", "minLength": 3},
+                                    },
+                                    "required": ["first_name", "last_name"],
+                                    "additionalProperties": False,
+                                }
                             }
                         },
+                        "required": True,
                     },
-                    "404": {"description": "Not found"},
+                    "responses": {"200": {"description": "OK"}},
                 },
-            },
-            "patch": {
-                "operationId": "updateUser",
-                "parameters": [
-                    {"in": "query", "name": "user_id", "required": True, "schema": {"type": "string"}},
-                ],
-                "requestBody": {
-                    "content": {
-                        "application/json": {
-                            "schema": {
-                                "type": "object",
-                                "properties": {
-                                    "id": {"type": "string", "minLength": 3},
-                                    "first_name": {"type": "string", "minLength": 3},
-                                    "last_name": {"type": "string", "minLength": 3},
-                                },
-                                "required": ["first_name", "last_name"],
-                                "additionalProperties": False,
-                            }
-                        }
-                    },
-                    "required": True,
-                },
-                "responses": {"200": {"description": "OK"}},
-            },
+            }
         }
-    }
-    schema = schemathesis.from_dict(empty_open_api_3_schema)
+    )
+    schema = schemathesis.from_dict(schema)
     response = requests.Response()
     body = b'{"id": "foo", "first_name": "TEST", "last_name": "TEST"}'
     response._content = body
@@ -179,8 +181,8 @@ EXPECTED_PATH_PARAMETERS = [
 
 
 @pytest.mark.parametrize(
-    "value, path_user_id, query_user_id, code",
-    (
+    ("value", "path_user_id", "query_user_id", "code"),
+    [
         (
             [{"path.user_id": 1, "query.user_id": 2, "code": 7}, {"path.user_id": 3, "query.user_id": 4, "code": 5}],
             [1, 3],
@@ -193,7 +195,7 @@ EXPECTED_PATH_PARAMETERS = [
             {"type": "integer"},
             {"type": "integer"},
         ),
-    ),
+    ],
 )
 def test_make_operation(value, path_user_id, query_user_id, code):
     operation = LINK.make_operation(list(map(ParsedData, value)))
@@ -240,7 +242,7 @@ BODY_SCHEMA = {"required": ["foo"], "type": "object", "properties": {"foo": {"ty
 
 @pytest.mark.parametrize(
     "body",
-    (
+    [
         OpenAPI20Body(
             {
                 "name": "attributes",
@@ -251,7 +253,7 @@ BODY_SCHEMA = {"required": ["foo"], "type": "object", "properties": {"foo": {"ty
             media_type="application/json",
         ),
         OpenAPI30Body(definition={"schema": BODY_SCHEMA}, media_type="application/json", required=True),
-    ),
+    ],
 )
 def test_make_operation_body(body):
     # See GH-1069
@@ -293,7 +295,7 @@ def test_invalid_request_body_definition():
         Link(name="Link", operation=operation, parameters={}, request_body={"requestBody": {"foo": "bar"}})
 
 
-@pytest.mark.parametrize("parameter", ("wrong.id", "unknown", "header.id"))
+@pytest.mark.parametrize("parameter", ["wrong.id", "unknown", "header.id"])
 def test_make_operation_invalid_location(parameter):
     with pytest.raises(
         ValueError, match=f"Parameter `{parameter}` is not defined in API operation GET /users/{{user_id}}"
@@ -311,31 +313,33 @@ def test_get_container_invalid_location(swagger_20):
             raw={},
             resolved={},
             scope="",
-            parameters=[
-                OpenAPI30Parameter({"in": "query", "name": "code", "type": "integer"}),
-                OpenAPI30Parameter({"in": "query", "name": "user_id", "type": "integer"}),
-                OpenAPI30Parameter({"in": "query", "name": "common", "type": "integer"}),
-            ],
         ),
     )
+    parameters = [
+        OpenAPI30Parameter({"in": "query", "name": "code", "type": "integer"}),
+        OpenAPI30Parameter({"in": "query", "name": "user_id", "type": "integer"}),
+        OpenAPI30Parameter({"in": "query", "name": "common", "type": "integer"}),
+    ]
+    for parameter in parameters:
+        operation.add_parameter(parameter)
     case = operation.make_case()
     with pytest.raises(ValueError, match="Parameter `unknown` is not defined in API operation `GET /users/{user_id}`"):
         get_container(case, None, "unknown")
 
 
 @pytest.mark.parametrize(
-    "status_code, expected",
-    (
+    ("status_code", "expected"),
+    [
         (200, ["Foo"]),
         (201, ["Bar"]),
-    ),
+    ],
 )
 def test_get_links_numeric_response_codes(status_code, openapi_30, expected):
     # See GH-1226
     # When API definition contains response statuses as integers
     operation = openapi_30["/users"]["GET"]
     link_definition = {"operationRef": "#/paths/~1users/get"}
-    operation.definition.resolved["responses"] = {
+    operation.definition.raw["responses"] = {
         "200": {"description": "OK", "links": {"Foo": link_definition}},
         # Could be here due to YAML parsing + disabled schema validation
         201: {"description": "OK", "links": {"Bar": link_definition}},

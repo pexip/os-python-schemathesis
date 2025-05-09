@@ -98,14 +98,13 @@ Here's an example of a simple custom authentication class. However, please note 
 
     import requests
 
-    # This is a real endpoint, try it out!
     TOKEN_ENDPOINT = "https://example.schemathesis.io/api/token/"
     USERNAME = "demo"
     PASSWORD = "test"
 
 
     class MyAuth:
-        def get(self, context):
+        def get(self, case, context):
             response = requests.post(
                 TOKEN_ENDPOINT,
                 json={"username": USERNAME, "password": PASSWORD},
@@ -140,16 +139,18 @@ To use your custom authentication mechanism in the Schemathesis CLI, you need to
         # Here goes your implementation
         ...
 
-Put the code above to the ``hooks.py`` file and extend your command via the ``SCHEMATHESIS_HOOKS`` environment variable:
+Then put your code into a Python file (for example, ``my_file.py``) and set the ``SCHEMATHESIS_HOOKS`` environment variable to point to it:
 
 .. code:: bash
 
-    $ SCHEMATHESIS_HOOKS=hooks
-    $ st run ...
+    SCHEMATHESIS_HOOKS=my_file
+    st run http://127.0.0.1/openapi.yaml
+
+That is it! Now Schemathesis will use your custom authentication mechanism for all tests.
 
 .. note::
 
-    You can take a look at how to extend CLI :ref:`here <extend-cli>`
+    The registration process is the same as for any other extension, and you can find more details on how to extend Schemathesis in the :ref:`Extending Schemathesis <enabling-extensions>` section.
 
 Using in Python tests
 ~~~~~~~~~~~~~~~~~~~~~
@@ -235,6 +236,8 @@ Conditions:
 - ``path``: the path of the API operation without its ``basePath``.
 - ``method``: the upper-cased HTTP method of the API operation
 - ``name``: the name of the API operation, such as ``GET /users/`` or ``Query.getUsers``
+- ``tag``: the tag assigned to the API operation. For Open API it comes from the ``tags`` field.
+- ``operation_id``: the ID of an API operation. For Open API it comes from the ``operationId`` field.
 - Each condition can take either a single string or a list of options as input
 - You can also use a regular expression to match the conditions by adding ``_regex`` to the end of the condition and passing a string or a compiled regex.
 
@@ -308,6 +311,27 @@ To disable caching completely, set ``refresh_interval`` to None. For example, th
         # Here goes your implementation
         ...
 
+The default implementation does not use a cache key, but you can provide one to distinguish tokens based on specific criteria.
+For instance, you may want separate cache entries for tokens with different OAuth scopes.
+
+.. code:: python
+
+    def get_scopes(context):
+        security = context.operation.definition.raw.get("security", [])
+        if not security:
+            return None
+        scopes = security[0][context.operation.get_security_requirements()[0]]
+        if not scopes:
+            return None
+        return frozenset(scopes)
+
+    def cache_by_key(case: Case, context: AuthContext) -> str:
+        scopes = get_scopes(context) or []
+        return ",".join(scopes)
+
+    @schema.auth(cache_by_key=cache_by_key)
+    class OAuth2Bearer:
+        ...
 
 WSGI / ASGI support
 ~~~~~~~~~~~~~~~~~~~
@@ -332,7 +356,7 @@ It could be done by using the ``context`` to get the application instance:
 
     @schema.auth()
     class MyAuth:
-        def get(self, context):
+        def get(self, case, context):
             client = TestClient(context.app)
             response = client.post(
                 TOKEN_ENDPOINT, json={"username": USERNAME, "password": PASSWORD}
@@ -359,7 +383,7 @@ It could be done by using the ``context`` to get the application instance:
 
     @schema.auth()
     class MyAuth:
-        def get(self, context):
+        def get(self, case, context):
             client = werkzeug.Client(context.app)
             response = client.post(
                 TOKEN_ENDPOINT, json={"username": USERNAME, "password": PASSWORD}
@@ -392,7 +416,7 @@ For example, you can use refresh tokens for authentication.
         def __init__(self):
             self.refresh_token = None
 
-        def get(self, context):
+        def get(self, case, context):
             if self.refresh_token is not None:
                 return self.refresh(context)
             return self.login(context)
@@ -418,6 +442,8 @@ For example, you can use refresh tokens for authentication.
         def set(self, case, data, context):
             case.headers = case.headers or {}
             case.headers = {"Authorization": f"Bearer {data}"}
+
+.. _third-party-auth:
 
 Third-party implementation
 --------------------------

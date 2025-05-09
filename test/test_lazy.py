@@ -1,4 +1,8 @@
+import sys
+
 import pytest
+
+from schemathesis._dependency_versions import IS_PYRATE_LIMITER_ABOVE_3
 
 
 def test_default(testdir):
@@ -29,7 +33,6 @@ lazy_schema = schemathesis.from_pytest_fixture("simple_schema")
 @lazy_schema.parametrize()
 def test_(request, case):
     request.config.HYPOTHESIS_CASES += 1
-
 """
     )
     result = testdir.runpytest("-v", "-s")
@@ -69,20 +72,28 @@ def test_(request, case):
     result = testdir.runpytest("-v", "-rf")
     # Then one test should be marked as failed (passed - /users, failed /)
     result.assert_outcomes(passed=1, failed=1)
-    if is_older_subtests:
+    if is_older_subtests.below_0_6_0:
         expected = [
-            r"test_invalid_operation.py::test_[GET /v1/valid] PASSED                   [ 25%]",
-            r"test_invalid_operation.py::test_[GET /v1/invalid] FAILED                 [ 50%]",
-            r"test_invalid_operation.py::test_[GET /v1/users] PASSED                   [ 75%]",
+            r"test_invalid_operation.py::test_\[GET /v1/valid\] PASSED *\[ 25%\]",
+            r"test_invalid_operation.py::test_\[GET /v1/invalid\] FAILED *\[ 50%\]",
+            r"test_invalid_operation.py::test_\[GET /v1/users\] PASSED *\[ 75%\]",
+            r".*1 passed",
+        ]
+    elif is_older_subtests.below_0_11_0:
+        expected = [
+            r"test_invalid_operation.py::test_\[GET /v1/valid\] SUBPASS +\[ 25%\]",
+            r"test_invalid_operation.py::test_\[GET /v1/invalid\] SUBFAIL +\[ 50%\]",
+            r"test_invalid_operation.py::test_\[GET /v1/users\] SUBPASS +\[ 75%\]",
             r".*1 passed",
         ]
     else:
         expected = [
-            r"test_invalid_operation.py::test_[GET /v1/valid] SUBPASS                  [ 25%]",
-            r"test_invalid_operation.py::test_[GET /v1/invalid] SUBFAIL                [ 50%]",
-            r"test_invalid_operation.py::test_[GET /v1/users] SUBPASS                  [ 75%]",
-            r".*1 passed",
+            r"test_invalid_operation.py::test_\[GET /v1/valid\] \(verbose_name='GET /v1/valid'\) SUBPASS +\[ 25%\]",
+            r"test_invalid_operation.py::test_\[GET /v1/invalid\] \(verbose_name='GET /v1/invalid'\) SUBFAIL +\[ 50%\]",
+            r"test_invalid_operation.py::test_\[GET /v1/users\] \(verbose_name='GET /v1/users'\) SUBPASS +\[ 75%\]",
+            r"test_invalid_operation.py::test_ PASSED +\[100%\]",
         ]
+
     result.stdout.re_match_lines(expected)
     # 100 for /valid, 1 for /users
     hypothesis_calls = (hypothesis_max_examples or 100) + 1
@@ -170,6 +181,7 @@ def test_d(request, case):
     result.stdout.re_match_lines([r"Hypothesis calls: 6$"])
 
 
+@pytest.mark.skipif(sys.version_info < (3, 9), reason="Decorator syntax available from Python 3.9")
 def test_with_parametrize_filters_override(testdir):
     # When the test uses method / endpoint filter
     testdir.make_test(
@@ -181,13 +193,17 @@ def test_a(request, case):
     request.config.HYPOTHESIS_CASES += 1
     assert case.method == "GET"
 
-@lazy_schema.parametrize(endpoint="/second", method=None)
+@lazy_schema.include(path_regex="/second", method=None).parametrize()
 def test_b(request, case):
     request.config.HYPOTHESIS_CASES += 1
     assert case.full_path == "/v1/second"
 
 @lazy_schema.parametrize()
 def test_c(request, case):
+    request.config.HYPOTHESIS_CASES += 1
+
+@lazy_schema.exclude(method=["post"]).parametrize()
+def test_d(request, case):
     request.config.HYPOTHESIS_CASES += 1
 """,
         paths={
@@ -205,24 +221,26 @@ def test_c(request, case):
             },
         },
         method="POST",
-        endpoint="/first",
+        path="/first",
         tag="foo",
     )
     result = testdir.runpytest("-v", "-s")
     # Then the filters should be applied to the generated tests
-    result.assert_outcomes(passed=3)
+    result.assert_outcomes(passed=4)
     result.stdout.re_match_lines(
         [
             r"test_with_parametrize_filters_override.py::test_a PASSED",
             r"test_with_parametrize_filters_override.py::test_b PASSED",
             r"test_with_parametrize_filters_override.py::test_c PASSED",
-            r".*3 passed",
+            r"test_with_parametrize_filters_override.py::test_d PASSED",
+            r".*4 passed",
         ]
     )
     # test_a: 2 = 2 GET to /first, /second
     # test_b: 2 = 1 GET + 1 POST to /second
     # test_c: 1 = 1 POST to /first
-    result.stdout.re_match_lines([r"Hypothesis calls: 5$"])
+    # test_d: 1 = 1 POST to /first
+    result.stdout.re_match_lines([r"Hypothesis calls: 6$"])
 
 
 def test_with_schema_filters(testdir):
@@ -274,7 +292,7 @@ def test_b(request, case):
             },
         },
         method="GET",
-        endpoint="/first",
+        path="/first",
     )
     result = testdir.runpytest("-v", "-s")
     # Then the filters should be applied to the generated tests
@@ -389,17 +407,17 @@ def test_(request, case):
     )
     result = testdir.runpytest("-v")
     result.assert_outcomes(passed=1, failed=1)
-    result.stdout.re_match_lines([r"E +InvalidSchema: Body parameters are defined for GET request."])
+    result.stdout.re_match_lines([r"E +BodyInGetRequestError: GET requests should not contain body parameters."])
 
 
 @pytest.mark.parametrize(
     "decorators",
-    (
+    [
         """@lazy_schema.hooks.apply(before_generate_headers)
 @lazy_schema.parametrize()""",
         """@lazy_schema.parametrize()
 @lazy_schema.hooks.apply(before_generate_headers)""",
-    ),
+    ],
 )
 def test_hooks_with_lazy_schema(testdir, simple_openapi, decorators):
     testdir.make_test(
@@ -417,7 +435,7 @@ def before_generate_headers(context, strategy):
     return strategy.map(convert)
 
 {decorators}
-@settings(max_examples=5)
+@settings(max_examples=5, suppress_health_check=[HealthCheck.filter_too_much])
 def test_(request, case):
     request.config.HYPOTHESIS_CASES += 1
     assert case.query["id"].isdigit()
@@ -430,7 +448,7 @@ def test_(request, case):
     result.stdout.re_match_lines(["Hypothesis calls: 5"])
 
 
-@pytest.mark.parametrize("given", ("data=st.data()", "st.data()"))
+@pytest.mark.parametrize("given", ["data=st.data()", "st.data()"])
 def test_schema_given(testdir, given):
     # When the schema is defined via a pytest fixture
     # And `schema.given` is used
@@ -508,7 +526,8 @@ def test_b(case):
     result.assert_outcomes(passed=2)
 
 
-def test_parametrized_fixture(testdir, openapi3_base_url, is_older_subtests):
+@pytest.mark.parametrize("settings", ["", "@settings(deadline=None)"])
+def test_parametrized_fixture(testdir, openapi3_base_url, is_older_subtests, settings):
     # When the used pytest fixture is parametrized via `params`
     testdir.make_test(
         f"""
@@ -521,6 +540,7 @@ def parametrized_lazy_schema(request):
 lazy_schema = schemathesis.from_pytest_fixture("parametrized_lazy_schema")
 
 @lazy_schema.parametrize()
+{settings}
 def test_(case):
     case.call()
 """,
@@ -528,16 +548,22 @@ def test_(case):
     result = testdir.runpytest("-v")
     # Then tests should be parametrized as usual
     result.assert_outcomes(passed=2)
-    if is_older_subtests:
+    if is_older_subtests.below_0_6_0:
         expected = [
             r"test_parametrized_fixture.py::test_\[a\]\[GET /api/users\] PASSED",
             r"test_parametrized_fixture.py::test_\[b\]\[GET /api/users\] PASSED",
         ]
-    else:
+    elif is_older_subtests.below_0_11_0:
         expected = [
             r"test_parametrized_fixture.py::test_\[a\]\[GET /api/users\] SUBPASS",
             r"test_parametrized_fixture.py::test_\[b\]\[GET /api/users\] SUBPASS",
         ]
+    else:
+        expected = [
+            r"test_parametrized_fixture.py::test_\[a\]\[GET /api/users\] \(verbose_name='GET /api/users'\) SUBPASS +\[ 33%\]",
+            r"test_parametrized_fixture.py::test_\[b\]\[GET /api/users\] \(verbose_name='GET /api/users'\) SUBPASS +\[ 75%\]",
+        ]
+
     result.stdout.re_match_lines(expected)
 
 
@@ -588,13 +614,17 @@ def pytest_terminal_summary(terminalreporter) -> None:
     )
     # Then it should be taken into account
     result = testdir.runpytest("-v")
-    result.assert_outcomes(passed=1)  # It is still a single test on the top level
     # And it should be the same test in the end
     message = r"test_data_generation_methods.py::test_\[GET /v1/users\] "
-    if is_older_subtests:
+    if is_older_subtests.below_0_6_0:
         message += "PASSED"
-    else:
+        result.assert_outcomes(passed=1)  # It is still a single test on the top level
+    elif is_older_subtests.below_0_11_0:
         message += "SUBPASS"
+        result.assert_outcomes(passed=1)  # It is still a single test on the top level
+    else:
+        message += r"\(verbose_name='GET /v1/users'\) SUBPASS"
+        # We do not assert the outcome here, because it is not reported.
     result.stdout.re_match_lines([message])
 
 
@@ -621,10 +651,12 @@ def test_(case):
     # Then the overridden one should be used
     result = testdir.runpytest("-v")
     result.assert_outcomes(passed=1)
-    if is_older_subtests:
+    if is_older_subtests.below_0_6_0:
         expected = r"test_data_generation_methods_override.py::test_\[GET /v1/users\] PASSED *\[ 50%\]"
-    else:
+    elif is_older_subtests.below_0_11_0:
         expected = r"test_data_generation_methods_override.py::test_\[GET /v1/users\] SUBPASS *\[ 50%\]"
+    else:
+        expected = r"test_data_generation_methods_override.py::test_\[GET /v1/users\] \(verbose_name='GET /v1/users'\) SUBPASS *\[ 50%\]"
     result.stdout.re_match_lines([expected])
 
 
@@ -710,12 +742,12 @@ def test_(case):
 
 @pytest.mark.parametrize(
     "decorators",
-    (
+    [
         """@schema.parametrize()
 @pytest.mark.acceptance""",
         """@pytest.mark.acceptance
 @schema.parametrize()""",
-    ),
+    ],
 )
 def test_marks_transfer(testdir, decorators):
     # See GH-1378
@@ -756,11 +788,15 @@ def test_(case):
     )
     # Then it should be skipped
     result = testdir.runpytest("-v", "-rs")
-    result.assert_outcomes(passed=1, skipped=1)
-    if is_older_subtests:
+    if is_older_subtests.below_0_6_0:
+        result.assert_outcomes(passed=1, skipped=1)
         expected = [r".* SKIPPED .*"]
-    else:
+    elif is_older_subtests.below_0_11_0:
+        result.assert_outcomes(passed=1, skipped=1)
         expected = [r".* SUBSKIP .*"]
+    else:
+        # We do not assert the outcome here, because it is not reported.
+        expected = []
     expected.append(r".*It is not possible to generate negative test cases.*")
     result.stdout.re_match_lines(expected)
 
@@ -804,11 +840,9 @@ def test_(case):
     result = testdir.runpytest()
     result.assert_outcomes(passed=1, failed=1)
     stdout = result.stdout.str()
-    assert "Received a response with 5xx status code: 500" in stdout
-    assert "Received a response with 5xx status code: 504" in stdout
+    assert "[500] Internal Server Error" in stdout
     # And internal frames should not be displayed
     assert "def run_subtest" not in stdout
-    assert "Falsifying example" not in stdout
 
 
 @pytest.mark.operations("multiple_failures")
@@ -835,13 +869,12 @@ def test_(case):
     result = testdir.runpytest()
     result.assert_outcomes(passed=1, failed=1)
     stdout = result.stdout.str()
-    assert "Received a response with 5xx status code: 500" in stdout
-    assert "Received a response with 5xx status code: 504" in stdout
+    assert "[500] Internal Server Error" in stdout
     assert "assert 1 == 2" in stdout
     # And internal frames should not be displayed
     assert "def run_subtest" not in stdout
     assert "def collecting_wrapper" not in stdout
-    assert stdout.count("test_multiple_failures_non_check.py:30") == 1
+    assert stdout.count("test_multiple_failures_non_check.py:37") == 1
 
 
 @pytest.mark.operations("flaky")
@@ -863,16 +896,52 @@ def test_(case):
     result = testdir.runpytest()
     result.assert_outcomes(passed=1, failed=1)
     stdout = result.stdout.str()
-    assert "Received a response with 5xx status code: 500" in stdout
+    assert "[500] Internal Server Error" in stdout
     # And internal frames should not be displayed
     assert "def run_subtest" not in stdout
     assert "def collecting_wrapper" not in stdout
     assert "def __flaky" not in stdout
-    assert stdout.count("test_flaky.py:2") == 1
+
+
+@pytest.mark.operations("failure")
+@pytest.mark.parametrize("value", [True, False])
+def test_output_sanitization(testdir, openapi3_schema_url, openapi3_base_url, value):
+    auth = "secret-auth"
+    testdir.make_test(
+        f"""
+@pytest.fixture
+def api_schema():
+    return schemathesis.from_uri('{openapi3_schema_url}')
+
+lazy_schema = schemathesis.from_pytest_fixture("api_schema", sanitize_output={value})
+
+@lazy_schema.parametrize()
+def test_(case):
+    case.call_and_validate(headers={{'Authorization': '{auth}'}})""",
+    )
+    result = testdir.runpytest()
+    # We should skip checking for a server error
+    result.assert_outcomes(passed=1, failed=1)
+    if value:
+        expected = rf"E           curl -X GET -H 'Authorization: [Filtered]' {openapi3_base_url}/failure"
+    else:
+        expected = rf"E           curl -X GET -H 'Authorization: {auth}' {openapi3_base_url}/failure"
+    assert expected in result.stdout.lines
 
 
 @pytest.mark.operations("success")
 def test_rate_limit(testdir, openapi3_schema_url):
+    if IS_PYRATE_LIMITER_ABOVE_3:
+        assertion = """
+    assert limiter.bucket_factory.bucket.rates[0].limit == 1
+    assert limiter.bucket_factory.bucket.rates[0].interval == 1000
+"""
+    else:
+        assertion = """
+    rate = limiter._rates[0]
+    assert rate.interval == 1
+    assert rate.limit == 1
+        """
     testdir.make_test(
         f"""
 @pytest.fixture
@@ -884,10 +953,33 @@ lazy_schema = schemathesis.from_pytest_fixture("api_schema", rate_limit="1/s")
 @lazy_schema.parametrize()
 def test_(case):
     limiter = case.operation.schema.rate_limiter
-    rate = limiter._rates[0]
-    assert rate.interval == 1
-    assert rate.limit == 1
+    {assertion}
 """,
+    )
+    result = testdir.runpytest()
+    result.assert_outcomes(passed=1)
+
+
+@pytest.mark.operations("path_variable", "custom_format")
+def test_override(testdir, openapi3_schema_url):
+    testdir.make_test(
+        f"""
+@pytest.fixture
+def api_schema():
+    return schemathesis.from_uri('{openapi3_schema_url}')
+
+lazy_schema = schemathesis.from_pytest_fixture("api_schema")
+
+@lazy_schema.parametrize(endpoint=["path_variable", "custom_format"])
+@lazy_schema.override(path_parameters={{"key": "foo"}}, query={{"id": "bar"}})
+def test(case):
+    if "key" in case.operation.path_parameters:
+        assert case.path_parameters["key"] == "foo"
+        assert "id" not in (case.query or {{}}), "`id` is present"
+    if "id" in case.operation.query:
+        assert case.query["id"] == "bar"
+        assert "key" not in (case.path_parameters or {{}}), "`key` is present"
+"""
     )
     result = testdir.runpytest()
     result.assert_outcomes(passed=1)
