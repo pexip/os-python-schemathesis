@@ -1,7 +1,5 @@
-import cgi
-import io
 import json
-from test.utils import assert_requests_call
+from email.message import EmailMessage
 from urllib.parse import quote, unquote
 
 import pytest
@@ -23,6 +21,7 @@ from schemathesis.specs.openapi.serialization import (
     matrix_object,
     matrix_primitive,
 )
+from test.utils import assert_requests_call
 
 PRIMITIVE_SCHEMA = {"type": "integer", "enum": [1]}
 NULLABLE_PRIMITIVE_SCHEMA = {"type": "integer", "enum": [1], "nullable": True}
@@ -177,7 +176,7 @@ class DelimitedObject(Prefixed):
 @schema.parametrize()
 def test_(request, case):
     request.config.HYPOTHESIS_CASES += 1
-    assert case.{attribute} in {repr(expected)}
+    assert case.{attribute} in {expected!r}
     """,
         schema=raw_schema,
     )
@@ -187,8 +186,8 @@ def test_(request, case):
 
 @pytest.mark.hypothesis_nested
 @pytest.mark.parametrize(
-    "schema, explode, style, expected",
-    (
+    ("schema", "explode", "style", "expected"),
+    [
         # Based on examples from https://swagger.io/docs/specification/serialization/
         (OBJECT_SCHEMA, True, "deepObject", {"color[r]": 100, "color[g]": 200, "color[b]": 150}),
         (OBJECT_SCHEMA, True, "form", {"r": 100, "g": 200, "b": 150}),
@@ -199,7 +198,7 @@ def test_(request, case):
         (ARRAY_SCHEMA, True, "spaceDelimited", {"color": ["blue", "black", "brown"]}),
         (ARRAY_SCHEMA, False, "form", {"color": "blue,black,brown"}),
         (ARRAY_SCHEMA, True, "form", {"color": ["blue", "black", "brown"]}),
-    ),
+    ],
 )
 def test_query_serialization_styles_openapi3(testdir, schema, explode, style, expected):
     raw_schema = make_openapi_schema(
@@ -210,13 +209,13 @@ def test_query_serialization_styles_openapi3(testdir, schema, explode, style, ex
 
 @pytest.mark.hypothesis_nested
 @pytest.mark.parametrize(
-    "schema, explode, expected",
-    (
+    ("schema", "explode", "expected"),
+    [
         (ARRAY_SCHEMA, True, {"X-Api-Key": "blue,black,brown"}),
         (ARRAY_SCHEMA, False, {"X-Api-Key": "blue,black,brown"}),
         (OBJECT_SCHEMA, True, {"X-Api-Key": DelimitedObject("r=100,g=200,b=150")}),
         (OBJECT_SCHEMA, False, {"X-Api-Key": CommaDelimitedObject("r,100,g,200,b,150")}),
-    ),
+    ],
 )
 def test_header_serialization_styles_openapi3(testdir, schema, explode, expected):
     raw_schema = make_openapi_schema(
@@ -227,13 +226,13 @@ def test_header_serialization_styles_openapi3(testdir, schema, explode, expected
 
 @pytest.mark.hypothesis_nested
 @pytest.mark.parametrize(
-    "schema, explode, expected",
-    (
+    ("schema", "explode", "expected"),
+    [
         (ARRAY_SCHEMA, True, {}),
         (ARRAY_SCHEMA, False, {"SessionID": "blue,black,brown"}),
         (OBJECT_SCHEMA, True, {}),
         (OBJECT_SCHEMA, False, {"SessionID": CommaDelimitedObject("r,100,g,200,b,150")}),
-    ),
+    ],
 )
 def test_cookie_serialization_styles_openapi3(testdir, schema, explode, expected):
     raw_schema = make_openapi_schema(
@@ -244,8 +243,8 @@ def test_cookie_serialization_styles_openapi3(testdir, schema, explode, expected
 
 @pytest.mark.hypothesis_nested
 @pytest.mark.parametrize(
-    "schema, style, explode, expected",
-    (
+    ("schema", "style", "explode", "expected"),
+    [
         (ARRAY_SCHEMA, "simple", False, {"color": quote("blue,black,brown")}),
         (NULLABLE_ARRAY_SCHEMA, "simple", False, {"color": quote("blue,black,brown")}),
         (ARRAY_SCHEMA, "simple", True, {"color": quote("blue,black,brown")}),
@@ -288,7 +287,7 @@ def test_cookie_serialization_styles_openapi3(testdir, schema, explode, expected
             True,
             {"color": DelimitedObject(";r=100;g=200;b=150", prefix=";", delimiter=";")},
         ),
-    ),
+    ],
 )
 def test_path_serialization_styles_openapi3(schema, style, explode, expected):
     raw_schema = {
@@ -347,14 +346,14 @@ def test_query_serialization_styles_openapi_multiple_params(testdir):
 
 @pytest.mark.hypothesis_nested
 @pytest.mark.parametrize(
-    "collection_format, expected",
-    (
+    ("collection_format", "expected"),
+    [
         ("csv", {"color": "blue,black,brown"}),
         ("ssv", {"color": "blue black brown"}),
         ("tsv", {"color": "blue\tblack\tbrown"}),
         ("pipes", {"color": "blue|black|brown"}),
         ("multi", {"color": ["blue", "black", "brown"]}),
-    ),
+    ],
 )
 def test_query_serialization_styles_swagger2(testdir, collection_format, expected):
     raw_schema = {
@@ -386,7 +385,7 @@ def test_query_serialization_styles_swagger2(testdir, collection_format, expecte
     assert_generates(testdir, raw_schema, (expected,), "query")
 
 
-@pytest.mark.parametrize("item, expected", (({}, {}), ({"key": 1}, {"key": "TEST"})))
+@pytest.mark.parametrize(("item", "expected"), [({}, {}), ({"key": 1}, {"key": "TEST"})])
 def test_item_is_missing(item, expected):
     # When there is no key in the data
 
@@ -425,8 +424,8 @@ def make_array_schema(location, style):
 
 
 @pytest.mark.parametrize(
-    "parameter, expected",
-    (
+    ("parameter", "expected"),
+    [
         (
             make_array_schema("query", "form"),
             ({"bbox": "1.1,1.1,1.1,1.1"},),
@@ -456,7 +455,7 @@ def make_array_schema(location, style):
             },
             ({"bbox": "1,1"}, {"bbox": ""}),
         ),
-    ),
+    ],
 )
 def test_non_string_serialization(testdir, parameter, expected):
     # GH: #651
@@ -465,8 +464,8 @@ def test_non_string_serialization(testdir, parameter, expected):
 
 
 @pytest.mark.parametrize(
-    "func, kwargs",
-    (
+    ("func", "kwargs"),
+    [
         (delimited, {"delimiter": ","}),
         (deep_object, {}),
         (comma_delimited_object, {}),
@@ -482,7 +481,7 @@ def test_non_string_serialization(testdir, parameter, expected):
         (matrix_array, {"explode": False}),
         (matrix_object, {"explode": True}),
         (matrix_object, {"explode": False}),
-    ),
+    ],
 )
 def test_nullable_parameters(
     func,
@@ -492,30 +491,30 @@ def test_nullable_parameters(
     assert func("foo", **kwargs)({"foo": None}) == {"foo": ""}
 
 
-def test_security_definition_parameter(testdir, empty_open_api_2_schema):
+def test_security_definition_parameter(ctx, testdir):
     # When the API contains an example for one of its parameters
-    empty_open_api_2_schema["paths"] = {
-        "/test": {
-            "post": {
-                "parameters": [
-                    {
-                        "name": "body",
-                        "in": "body",
-                        "schema": {
-                            "type": "object",
-                            "example": {"foo": "bar"},
+    schema = ctx.openapi.build_schema(
+        {
+            "/test": {
+                "post": {
+                    "parameters": [
+                        {
+                            "name": "body",
+                            "in": "body",
+                            "schema": {
+                                "type": "object",
+                                "example": {"foo": "bar"},
+                            },
                         },
-                    },
-                ],
-                "responses": {"200": {"description": "OK"}},
+                    ],
+                    "responses": {"200": {"description": "OK"}},
+                }
             }
-        }
-    }
-    # And a security definition that is used for data generation
-    empty_open_api_2_schema["securityDefinitions"] = {
-        "token": {"type": "apiKey", "name": "Authorization", "in": "header"}
-    }
-    empty_open_api_2_schema["security"] = [{"token": []}]
+        },
+        securityDefinitions={"token": {"type": "apiKey", "name": "Authorization", "in": "header"}},
+        security=[{"token": []}],
+        version="2.0",
+    )
     testdir.make_test(
         """
 @schema.parametrize()
@@ -523,7 +522,7 @@ def test_security_definition_parameter(testdir, empty_open_api_2_schema):
 def test_(case):
     pass
         """,
-        schema=empty_open_api_2_schema,
+        schema=schema,
     )
     result = testdir.runpytest("-v")
     # Then it should work as expected
@@ -535,21 +534,26 @@ def test_(case):
     "type_name",
     # `null` is not a valid Open API type, but it is possible to have `None` with custom hooks, therefore it is here
     # for simplicity
-    ("null", "string", "boolean", "array", "integer", "number"),
+    ["null", "string", "boolean", "array", "integer", "number"],
 )
-def test_unusual_form_schema(empty_open_api_3_schema, type_name):
+def test_unusual_form_schema(ctx, type_name):
     # See GH-1152
     # When API schema defines multipart media type
     # And its schema is not an object or bytes (string + format=byte)
-    empty_open_api_3_schema["paths"] = {
-        "/multipart": {
-            "post": {
-                "requestBody": {"content": {"multipart/form-data": {"schema": {"type": type_name}}}, "required": True},
-                "responses": {"200": {"description": "OK"}},
+    schema = ctx.openapi.build_schema(
+        {
+            "/multipart": {
+                "post": {
+                    "requestBody": {
+                        "content": {"multipart/form-data": {"schema": {"type": type_name}}},
+                        "required": True,
+                    },
+                    "responses": {"200": {"description": "OK"}},
+                }
             }
         }
-    }
-    schema = schemathesis.from_dict(empty_open_api_3_schema, validate_schema=False)
+    )
+    schema = schemathesis.from_dict(schema, validate_schema=False)
 
     @given(case=schema["/multipart"]["POST"].as_strategy())
     @settings(max_examples=5, deadline=None)
@@ -557,26 +561,25 @@ def test_unusual_form_schema(empty_open_api_3_schema, type_name):
         # Then it should lead to a valid network request
         assert_requests_call(case)
         # And should contain the proper content type
-        kwargs = case.as_requests_kwargs()
+        kwargs = case.as_transport_kwargs()
         content_type = kwargs["headers"]["Content-Type"]
         assert content_type.startswith("multipart/form-data; boundary=")
         # And data is a valid multipart
-        _, options = cgi.parse_header(content_type)
-        options["boundary"] = options["boundary"].encode()
-        options["CONTENT-LENGTH"] = len(kwargs["data"])
-        cgi.parse_multipart(io.BytesIO(kwargs["data"]), options)
+        message = EmailMessage()
+        message.attach(kwargs["data"])
+        assert message.is_multipart()
         # When custom headers are passed
-        headers = case.as_requests_kwargs(headers={"Authorization": "Bearer FOO"})["headers"]
+        headers = case.as_transport_kwargs(headers={"Authorization": "Bearer FOO"})["headers"]
         # Then content type should be valid
         assert headers["Content-Type"].startswith("multipart/form-data; boundary=")
         # And the original headers are preserved
         assert headers["Authorization"] == "Bearer FOO"
         # When the Content-Type header is passed explicitly
-        headers = case.as_requests_kwargs(headers={"Content-Type": "text/plain"})["headers"]
+        headers = case.as_transport_kwargs(headers={"Content-Type": "text/plain"})["headers"]
         # Then it should be preferred
         assert headers["Content-Type"] == "text/plain"
         # And it should be case-insensitive
-        headers = case.as_requests_kwargs(headers={"content-type": "text/plain"})["headers"]
+        headers = case.as_transport_kwargs(headers={"content-type": "text/plain"})["headers"]
         assert headers["content-type"] == "text/plain"
         assert list(headers) == ["content-type", "User-Agent", SCHEMATHESIS_TEST_CASE_HEADER]
 

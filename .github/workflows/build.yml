@@ -1,5 +1,4 @@
-name: Build jobs
-# Triggered by changes in code-specific or job-specific files
+name: CI
 
 on:
   pull_request:
@@ -24,24 +23,25 @@ env:
 jobs:
   pre-commit:
     name: Generic pre-commit checks
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v3.0.0
+      - uses: actions/checkout@v4.2.1
         with:
           fetch-depth: 1
 
-      - uses: actions/setup-python@v3.1.0
+      - uses: actions/setup-python@v5
         with:
-          python-version: 3.9
+          python-version: 3.11
 
-      - run: pip install pre-commit
-      - run: pre-commit run --all-files
+      - uses: hynek/setup-cached-uv@v2
+
+      - run: uvx pre-commit run --all-files
 
   docs:
     name: Documentation
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v3.0.0
+      - uses: actions/checkout@v4.2.1
         with:
           fetch-depth: 1
       - uses: ammaraskar/sphinx-action@master
@@ -51,39 +51,78 @@ jobs:
   tests:
     strategy:
       matrix:
-        os: [ubuntu-20.04, windows-2019]
-        python: ["3.7", "3.8", "3.9", "3.10", "3.11"]
-        # Set the patch version for "python", so GitHub adds 3 configurations instead of expanding existing ones
+        os: [ubuntu-22.04, windows-2019]
+        python: ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+        # Set the patch version for "python", so GitHub adds these configurations instead of expanding existing ones
         include:
-          - os: ubuntu-20.04
-            python: "3.9.16"
-            tox_env: hypothesis648
-          - os: ubuntu-20.04
+          - os: ubuntu-22.04
             python: "3.9.16"
             tox_env: pytest6
-          - os: ubuntu-20.04
-            python: "3.9.16"
-            tox_env: pytest53
       fail-fast: false
 
     name: Tests (Python ${{ matrix.python }} on ${{ matrix.os }} ${{ matrix.tox_env }})
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v3.0.0
+      - uses: actions/checkout@v4.2.1
         with:
           fetch-depth: 1
 
-      - uses: actions/setup-python@v3.1.0
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
 
-      - run: pip install tox tox-gh-actions
+      - uses: hynek/setup-cached-uv@v2
 
       - if: ${{ matrix.tox_env }}
-        run: python -m tox -e ${{ matrix.tox_env }}
+        run: uvx --with="tox" --with="tox-gh-actions" --with="tox-uv" tox -e ${{ matrix.tox_env }}
 
       - if: ${{ !matrix.tox_env }}
-        run: python -m tox
+        run: uvx --with="tox" --with="tox-gh-actions" --with="tox-uv" tox
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3.0.0
+        uses: codecov/codecov-action@v5.1.2
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # On windows redirecting output to a file could lead to an error due to the default IO encoding being CP-1252
+  tests-pipe-with-encoding:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, windows-2019]
+      fail-fast: false
+    name: Test piping output to a file with CP1252 encoding on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4.2.1
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: hynek/setup-cached-uv@v2
+
+      - run: uv tool install ".[dev]"
+
+      - run: uv tool run schemathesis run /openapi.json --app=cp1252_app:app -c custom_check > out.txt || true
+        working-directory: ./test/apps
+        env:
+          SCHEMATHESIS_HOOKS: hooks
+          PYTHONIOENCODING: cp1252
+
+      - run: |
+          if grep -Fq "UnicodeEncodeError" "out.txt"; then
+            echo "Failed!"
+            exit 1
+          fi
+        working-directory: ./test/apps
+        shell: bash
+
+  spell-check:
+    name: Spell Check
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: crate-ci/typos@master

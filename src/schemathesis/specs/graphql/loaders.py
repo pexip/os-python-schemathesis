@@ -1,37 +1,63 @@
+from __future__ import annotations
+
+import json
 import pathlib
-from typing import IO, Any, Callable, Dict, Optional, Union, cast
+from functools import lru_cache
+from json import JSONDecodeError
+from typing import IO, TYPE_CHECKING, Any, Callable, Dict, NoReturn, cast
 
-import backoff
-import graphql
-import requests
-from graphql import ExecutionResult
-from pyrate_limiter import Limiter
-from starlette.applications import Starlette
-from starlette_testclient import TestClient as ASGIClient
-from werkzeug import Client
-from yarl import URL
-
-from ...constants import DEFAULT_DATA_GENERATION_METHODS, WAIT_FOR_SCHEMA_INTERVAL, CodeSampleStyle
-from ...exceptions import HTTPError
+from ...code_samples import CodeSampleStyle
+from ...constants import DEFAULT_RESPONSE_TIMEOUT, WAIT_FOR_SCHEMA_INTERVAL
+from ...exceptions import SchemaError, SchemaErrorType
+from ...generation import (
+    DEFAULT_DATA_GENERATION_METHODS,
+    DataGenerationMethod,
+    DataGenerationMethodInput,
+    GenerationConfig,
+)
 from ...hooks import HookContext, dispatch
+from ...internal.output import OutputConfig
+from ...internal.validation import require_relative_url
+from ...loaders import load_schema_from_url
 from ...throttling import build_limiter
-from ...types import DataGenerationMethodInput, PathLike
-from ...utils import WSGIResponse, prepare_data_generation_methods, require_relative_url, setup_headers
-from .schemas import GraphQLSchema
+from ...transports.headers import setup_default_headers
+from ...types import PathLike, Specification
 
-INTROSPECTION_QUERY = graphql.get_introspection_query()
-INTROSPECTION_QUERY_AST = graphql.parse(INTROSPECTION_QUERY)
+if TYPE_CHECKING:
+    from graphql import DocumentNode
+    from pyrate_limiter import Limiter
+
+    from ...transports.responses import GenericResponse
+    from .schemas import GraphQLSchema
+
+
+@lru_cache
+def get_introspection_query() -> str:
+    import graphql
+
+    return graphql.get_introspection_query()
+
+
+@lru_cache
+def get_introspection_query_ast() -> DocumentNode:
+    import graphql
+
+    query = get_introspection_query()
+    return graphql.parse(query)
 
 
 def from_path(
     path: PathLike,
     *,
     app: Any = None,
-    base_url: Optional[str] = None,
+    base_url: str | None = None,
     data_generation_methods: DataGenerationMethodInput = DEFAULT_DATA_GENERATION_METHODS,
+    generation_config: GenerationConfig | None = None,
+    output_config: OutputConfig | None = None,
     code_sample_style: str = CodeSampleStyle.default().name,
-    rate_limit: Optional[str] = None,
+    rate_limit: str | None = None,
     encoding: str = "utf8",
+    sanitize_output: bool = True,
 ) -> GraphQLSchema:
     """Load GraphQL schema via a file from an OS path.
 
@@ -45,21 +71,42 @@ def from_path(
             base_url=base_url,
             data_generation_methods=data_generation_methods,
             code_sample_style=code_sample_style,
+            generation_config=generation_config,
+            output_config=output_config,
             location=pathlib.Path(path).absolute().as_uri(),
             rate_limit=rate_limit,
+            sanitize_output=sanitize_output,
         )
+
+
+def extract_schema_from_response(response: GenericResponse) -> dict[str, Any]:
+    from requests import Response
+
+    try:
+        if isinstance(response, Response):
+            decoded = response.json()
+        else:
+            decoded = response.json
+    except JSONDecodeError as exc:
+        raise SchemaError(
+            SchemaErrorType.UNEXPECTED_CONTENT_TYPE,
+            "Received unsupported content while expecting a JSON payload for GraphQL",
+        ) from exc
+    return decoded
 
 
 def from_url(
     url: str,
     *,
     app: Any = None,
-    base_url: Optional[str] = None,
-    port: Optional[int] = None,
+    base_url: str | None = None,
+    port: int | None = None,
     data_generation_methods: DataGenerationMethodInput = DEFAULT_DATA_GENERATION_METHODS,
+    generation_config: GenerationConfig | None = None,
     code_sample_style: str = CodeSampleStyle.default().name,
-    wait_for_schema: Optional[float] = None,
-    rate_limit: Optional[str] = None,
+    wait_for_schema: float | None = None,
+    rate_limit: str | None = None,
+    sanitize_output: bool = True,
     **kwargs: Any,
 ) -> GraphQLSchema:
     """Load GraphQL schema from the network.
@@ -71,9 +118,14 @@ def from_url(
     :param app: A WSGI app instance.
     :return: GraphQLSchema
     """
-    setup_headers(kwargs)
-    kwargs.setdefault("json", {"query": INTROSPECTION_QUERY})
+    import backoff
+    import requests
+
+    setup_default_headers(kwargs)
+    kwargs.setdefault("json", {"query": get_introspection_query()})
     if port:
+        from yarl import URL
+
         url = str(URL(url).with_port(port))
         if not base_url:
             base_url = url
@@ -87,71 +139,100 @@ def from_url(
             interval=WAIT_FOR_SCHEMA_INTERVAL,
         )
         def _load_schema(_uri: str, **_kwargs: Any) -> requests.Response:
-            return requests.post(_uri, **kwargs)
+            return requests.post(_uri, **_kwargs)
 
     else:
         _load_schema = requests.post
-    response = _load_schema(url, **kwargs)
-    HTTPError.raise_for_status(response)
-    decoded = response.json()
+
+    kwargs.setdefault("timeout", DEFAULT_RESPONSE_TIMEOUT / 1000)
+    response = load_schema_from_url(lambda: _load_schema(url, **kwargs))
+    raw_schema = extract_schema_from_response(response)
     return from_dict(
-        raw_schema=decoded["data"],
+        raw_schema=raw_schema,
         location=url,
         base_url=base_url,
         app=app,
         data_generation_methods=data_generation_methods,
         code_sample_style=code_sample_style,
         rate_limit=rate_limit,
+        sanitize_output=sanitize_output,
     )
 
 
 def from_file(
-    file: Union[IO[str], str],
+    file: IO[str] | str,
     *,
     app: Any = None,
-    base_url: Optional[str] = None,
+    base_url: str | None = None,
     data_generation_methods: DataGenerationMethodInput = DEFAULT_DATA_GENERATION_METHODS,
+    generation_config: GenerationConfig | None = None,
+    output_config: OutputConfig | None = None,
     code_sample_style: str = CodeSampleStyle.default().name,
-    location: Optional[str] = None,
-    rate_limit: Optional[str] = None,
+    location: str | None = None,
+    rate_limit: str | None = None,
+    sanitize_output: bool = True,
 ) -> GraphQLSchema:
     """Load GraphQL schema from a file descriptor or a string.
 
     :param file: Could be a file descriptor, string or bytes.
     """
+    import graphql
+
     if isinstance(file, str):
         data = file
     else:
         data = file.read()
-    document = graphql.build_schema(data)
-    result = graphql.execute(document, INTROSPECTION_QUERY_AST)
-    # TYPES: We don't pass `is_awaitable` above, therefore `result` is of the `ExecutionResult` type
-    result = cast(ExecutionResult, result)
-    # TYPES:
-    #  - `document` is a valid schema, because otherwise `build_schema` will rise an error;
-    #  - `INTROSPECTION_QUERY` is a valid query - it is known upfront;
-    # Therefore the execution result is always valid at this point and `result.data` is not `None`
-    raw_schema = cast(Dict[str, Any], result.data)
+    try:
+        document = graphql.build_schema(data)
+        result = graphql.execute(document, get_introspection_query_ast())
+        # TYPES: We don't pass `is_awaitable` above, therefore `result` is of the `ExecutionResult` type
+        result = cast(graphql.ExecutionResult, result)
+        # TYPES:
+        #  - `document` is a valid schema, because otherwise `build_schema` will rise an error;
+        #  - `INTROSPECTION_QUERY` is a valid query - it is known upfront;
+        # Therefore the execution result is always valid at this point and `result.data` is not `None`
+        raw_schema = cast(Dict[str, Any], result.data)
+    except Exception as exc:
+        try:
+            raw_schema = json.loads(data)
+            if not isinstance(raw_schema, dict) or "__schema" not in raw_schema:
+                _on_invalid_schema(exc)
+        except json.JSONDecodeError:
+            _on_invalid_schema(exc, extras=[entry for entry in str(exc).splitlines() if entry])
     return from_dict(
         raw_schema,
         app=app,
         base_url=base_url,
         data_generation_methods=data_generation_methods,
+        generation_config=generation_config,
+        output_config=output_config,
         code_sample_style=code_sample_style,
         location=location,
         rate_limit=rate_limit,
+        sanitize_output=sanitize_output,
     )
 
 
+def _on_invalid_schema(exc: Exception, extras: list[str] | None = None) -> NoReturn:
+    raise SchemaError(
+        SchemaErrorType.GRAPHQL_INVALID_SCHEMA,
+        "The provided API schema does not appear to be a valid GraphQL schema",
+        extras=extras or [],
+    ) from exc
+
+
 def from_dict(
-    raw_schema: Dict[str, Any],
+    raw_schema: dict[str, Any],
     *,
     app: Any = None,
-    base_url: Optional[str] = None,
-    location: Optional[str] = None,
+    base_url: str | None = None,
+    location: str | None = None,
     data_generation_methods: DataGenerationMethodInput = DEFAULT_DATA_GENERATION_METHODS,
+    generation_config: GenerationConfig | None = None,
+    output_config: OutputConfig | None = None,
     code_sample_style: str = CodeSampleStyle.default().name,
-    rate_limit: Optional[str] = None,
+    rate_limit: str | None = None,
+    sanitize_output: bool = True,
 ) -> GraphQLSchema:
     """Load GraphQL schema from a Python dictionary.
 
@@ -161,20 +242,30 @@ def from_dict(
     :param app: A WSGI app instance.
     :return: GraphQLSchema
     """
+    from ... import transports
+    from .schemas import GraphQLSchema
+
     _code_sample_style = CodeSampleStyle.from_str(code_sample_style)
     hook_context = HookContext()
+    if "data" in raw_schema:
+        raw_schema = raw_schema["data"]
     dispatch("before_load_schema", hook_context, raw_schema)
-    rate_limiter: Optional[Limiter] = None
+    rate_limiter: Limiter | None = None
     if rate_limit is not None:
         rate_limiter = build_limiter(rate_limit)
     instance = GraphQLSchema(
         raw_schema,
+        specification=Specification.GRAPHQL,
         location=location,
         base_url=base_url,
         app=app,
-        data_generation_methods=prepare_data_generation_methods(data_generation_methods),
+        data_generation_methods=DataGenerationMethod.ensure_list(data_generation_methods),
+        generation_config=generation_config or GenerationConfig(),
+        output_config=output_config or OutputConfig(),
         code_sample_style=_code_sample_style,
         rate_limiter=rate_limiter,
+        sanitize_output=sanitize_output,
+        transport=transports.get(app),
     )  # type: ignore
     dispatch("after_load_schema", hook_context, instance)
     return instance
@@ -184,10 +275,13 @@ def from_wsgi(
     schema_path: str,
     app: Any,
     *,
-    base_url: Optional[str] = None,
+    base_url: str | None = None,
     data_generation_methods: DataGenerationMethodInput = DEFAULT_DATA_GENERATION_METHODS,
+    generation_config: GenerationConfig | None = None,
+    output_config: OutputConfig | None = None,
     code_sample_style: str = CodeSampleStyle.default().name,
-    rate_limit: Optional[str] = None,
+    rate_limit: str | None = None,
+    sanitize_output: bool = True,
     **kwargs: Any,
 ) -> GraphQLSchema:
     """Load GraphQL schema from a WSGI app.
@@ -197,20 +291,27 @@ def from_wsgi(
     :param Optional[str] base_url: Base URL to send requests to.
     :return: GraphQLSchema
     """
+    from werkzeug import Client
+
+    from ...transports.responses import WSGIResponse
+
     require_relative_url(schema_path)
-    setup_headers(kwargs)
-    kwargs.setdefault("json", {"query": INTROSPECTION_QUERY})
+    setup_default_headers(kwargs)
+    kwargs.setdefault("json", {"query": get_introspection_query()})
     client = Client(app, WSGIResponse)
-    response = client.post(schema_path, **kwargs)
-    HTTPError.check_response(response, schema_path)
+    response = load_schema_from_url(lambda: client.post(schema_path, **kwargs))
+    raw_schema = extract_schema_from_response(response)
     return from_dict(
-        raw_schema=response.json["data"],
+        raw_schema=raw_schema,
         location=schema_path,
         base_url=base_url,
         app=app,
         data_generation_methods=data_generation_methods,
+        generation_config=generation_config,
+        output_config=output_config,
         code_sample_style=code_sample_style,
         rate_limit=rate_limit,
+        sanitize_output=sanitize_output,
     )
 
 
@@ -218,10 +319,13 @@ def from_asgi(
     schema_path: str,
     app: Any,
     *,
-    base_url: Optional[str] = None,
+    base_url: str | None = None,
     data_generation_methods: DataGenerationMethodInput = DEFAULT_DATA_GENERATION_METHODS,
+    generation_config: GenerationConfig | None = None,
+    output_config: OutputConfig | None = None,
     code_sample_style: str = CodeSampleStyle.default().name,
-    rate_limit: Optional[str] = None,
+    rate_limit: str | None = None,
+    sanitize_output: bool = True,
     **kwargs: Any,
 ) -> GraphQLSchema:
     """Load GraphQL schema from an ASGI app.
@@ -230,24 +334,31 @@ def from_asgi(
     :param app: An ASGI app instance.
     :param Optional[str] base_url: Base URL to send requests to.
     """
+    from starlette_testclient import TestClient as ASGIClient
+
     require_relative_url(schema_path)
-    setup_headers(kwargs)
-    kwargs.setdefault("json", {"query": INTROSPECTION_QUERY})
+    setup_default_headers(kwargs)
+    kwargs.setdefault("json", {"query": get_introspection_query()})
     client = ASGIClient(app)
-    response = client.post(schema_path, **kwargs)
-    HTTPError.check_response(response, schema_path)
+    response = load_schema_from_url(lambda: client.post(schema_path, **kwargs))
+    raw_schema = extract_schema_from_response(response)
     return from_dict(
-        response.json()["data"],
+        raw_schema=raw_schema,
         location=schema_path,
         base_url=base_url,
         app=app,
         data_generation_methods=data_generation_methods,
+        generation_config=generation_config,
+        output_config=output_config,
         code_sample_style=code_sample_style,
         rate_limit=rate_limit,
+        sanitize_output=sanitize_output,
     )
 
 
 def get_loader_for_app(app: Any) -> Callable:
-    if isinstance(app, Starlette):
+    from ...transports.asgi import is_asgi_app
+
+    if is_asgi_app(app):
         return from_asgi
     return from_wsgi

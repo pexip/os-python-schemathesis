@@ -32,13 +32,13 @@ type Query {
 
 
 @pytest.mark.parametrize(
-    "class_decorator, pre_parametrize_decorator, post_parametrize_decorator",
-    (
+    ("class_decorator", "pre_parametrize_decorator", "post_parametrize_decorator"),
+    [
         ("@schemathesis.auth()", "", ""),
         ("@schema.auth()", "", ""),
         ("", f"@schema.auth({AUTH_CLASS_NAME})", ""),
         ("", "", f"@schema.auth({AUTH_CLASS_NAME})"),
-    ),
+    ],
     ids=("global", "schema", "test-pre-parametrize", "test-post-parametrize"),
 )
 def test_different_scopes(
@@ -52,7 +52,7 @@ TOKEN = "Foo"
 {class_decorator}
 class {AUTH_CLASS_NAME}:
 
-    def get(self, context):
+    def get(self, case, context):
         return TOKEN
 
     def set(self, case, data, context):
@@ -89,7 +89,7 @@ import werkzeug
 @schema.auth()
 class Auth:
 
-    def get(self, context):
+    def get(self, case, context):
         client = werkzeug.Client(context.app)
         response = client.post("/auth/token/", json={"username": "test", "password": "pass"})
         return response.json["access_token"]
@@ -105,7 +105,7 @@ from starlette_testclient import TestClient
 @schema.auth()
 class Auth:
 
-    def get(self, context):
+    def get(self, case, context):
         client = TestClient(context.app)
         response = client.post("/auth/token/", json={"username": "test", "password": "pass"})
         return response.json()["access_token"]
@@ -155,7 +155,7 @@ def token(data: AuthInput):
         return {{"access_token": "{APP_TEST_TOKEN}"}}
     raise HTTPException(status_code=401, detail="Unauthorized")
 
-schema = schemathesis.from_asgi("/openapi.json", app=app)
+schema = schemathesis.from_asgi("/openapi.json", app=app, force_schema_version="30")
 """
 
 
@@ -190,7 +190,7 @@ TOKEN = "Foo"
 @lazy_schema.auth()
 class {AUTH_CLASS_NAME}:
 
-    def get(self, context):
+    def get(self, case, context):
         return TOKEN
 
     def set(self, case, data, context):
@@ -225,7 +225,7 @@ schema.auth.set_from_requests(auth).apply_to(method="GET", path="/success")
 @schema.parametrize()
 @settings(max_examples=2)
 def test(case):
-    case_auth = case.as_requests_kwargs().get("auth")
+    case_auth = case.as_transport_kwargs().get("auth")
     if case.operation.path == "/success":
         assert case_auth is auth
     if case.operation.path == "/text":
@@ -234,7 +234,7 @@ def test(case):
         schema=app_schema,
     )
     result = testdir.runpytest("-s")
-    # Then auth should be present in `as_requests_kwargs` output
+    # Then auth should be present in `as_transport_kwargs` output
     result.assert_outcomes(passed=2)
 
 
@@ -260,7 +260,7 @@ TOKEN_1 = "ABC"
 
 {dec1}
 class TokenAuth1:
-    def get(self, context):
+    def get(self, case, context):
         return TOKEN_1
 
     def set(self, case, data, context):
@@ -271,7 +271,7 @@ TOKEN_2 = "DEF"
 
 {dec2}
 class TokenAuth2:
-    def get(self, context):
+    def get(self, case, context):
         return TOKEN_2
 
     def set(self, case, data, context):

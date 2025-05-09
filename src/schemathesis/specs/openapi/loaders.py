@@ -1,38 +1,41 @@
+from __future__ import annotations
+
 import io
 import json
 import pathlib
-from typing import IO, Any, Callable, Dict, List, Optional, Tuple, Union, cast
+import re
+from typing import IO, TYPE_CHECKING, Any, Callable, cast
 from urllib.parse import urljoin
 
-import backoff
-import jsonschema
-import requests
-import yaml
-from jsonschema import ValidationError
-from pyrate_limiter import Limiter
-from starlette.applications import Starlette
-from starlette_testclient import TestClient as ASGIClient
-from werkzeug.test import Client
-from yarl import URL
-
-from ...constants import DEFAULT_DATA_GENERATION_METHODS, WAIT_FOR_SCHEMA_INTERVAL, CodeSampleStyle
-from ...exceptions import HTTPError, SchemaLoadingError
-from ...hooks import HookContext, dispatch
-from ...lazy import LazySchema
-from ...throttling import build_limiter
-from ...types import DataGenerationMethodInput, Filter, NotSet, PathLike
-from ...utils import (
-    NOT_SET,
-    GenericResponse,
-    StringDatesYAMLLoader,
-    WSGIResponse,
-    is_json_media_type,
-    prepare_data_generation_methods,
-    require_relative_url,
-    setup_headers,
+from ... import experimental, fixups
+from ...code_samples import CodeSampleStyle
+from ...constants import DEFAULT_RESPONSE_TIMEOUT, NOT_SET, WAIT_FOR_SCHEMA_INTERVAL
+from ...exceptions import SchemaError, SchemaErrorType
+from ...filters import filter_set_from_components
+from ...generation import (
+    DEFAULT_DATA_GENERATION_METHODS,
+    DataGenerationMethod,
+    DataGenerationMethodInput,
+    GenerationConfig,
 )
+from ...hooks import HookContext, dispatch
+from ...internal.deprecation import warn_filtration_arguments
+from ...internal.output import OutputConfig
+from ...internal.validation import require_relative_url
+from ...loaders import load_schema_from_url, load_yaml
+from ...throttling import build_limiter
+from ...transports.content_types import is_json_media_type, is_yaml_media_type
+from ...transports.headers import setup_default_headers
+from ...types import Filter, NotSet, PathLike, Specification
 from . import definitions, validation
-from .schemas import BaseOpenAPISchema, OpenApi30, SwaggerV20
+
+if TYPE_CHECKING:
+    import jsonschema
+    from pyrate_limiter import Limiter
+
+    from ...lazy import LazySchema
+    from ...transports.responses import GenericResponse
+    from .schemas import BaseOpenAPISchema
 
 
 def _is_json_response(response: GenericResponse) -> bool:
@@ -43,28 +46,47 @@ def _is_json_response(response: GenericResponse) -> bool:
     return False
 
 
-def _is_json_path(path: PathLike) -> bool:
+def _has_suffix(path: PathLike, suffix: str) -> bool:
     if isinstance(path, str):
-        return path.endswith(".json")
-    return path.suffix == ".json"
+        return path.endswith(suffix)
+    return path.suffix == suffix
+
+
+def _is_json_path(path: PathLike) -> bool:
+    return _has_suffix(path, ".json")
+
+
+def _is_yaml_response(response: GenericResponse) -> bool:
+    """Guess if the response contains YAML."""
+    content_type = response.headers.get("Content-Type")
+    if content_type is not None:
+        return is_yaml_media_type(content_type)
+    return False
+
+
+def _is_yaml_path(path: PathLike) -> bool:
+    return _has_suffix(path, ".yaml") or _has_suffix(path, ".yml")
 
 
 def from_path(
     path: PathLike,
     *,
     app: Any = None,
-    base_url: Optional[str] = None,
-    method: Optional[Filter] = None,
-    endpoint: Optional[Filter] = None,
-    tag: Optional[Filter] = None,
-    operation_id: Optional[Filter] = None,
-    skip_deprecated_operations: bool = False,
+    base_url: str | None = None,
+    method: Filter | None = None,
+    endpoint: Filter | None = None,
+    tag: Filter | None = None,
+    operation_id: Filter | None = None,
+    skip_deprecated_operations: bool | None = None,
     validate_schema: bool = False,
-    force_schema_version: Optional[str] = None,
+    force_schema_version: str | None = None,
     data_generation_methods: DataGenerationMethodInput = DEFAULT_DATA_GENERATION_METHODS,
+    generation_config: GenerationConfig | None = None,
+    output_config: OutputConfig | None = None,
     code_sample_style: str = CodeSampleStyle.default().name,
-    rate_limit: Optional[str] = None,
+    rate_limit: str | None = None,
     encoding: str = "utf8",
+    sanitize_output: bool = True,
 ) -> BaseOpenAPISchema:
     """Load Open API schema via a file from an OS path.
 
@@ -84,10 +106,14 @@ def from_path(
             validate_schema=validate_schema,
             force_schema_version=force_schema_version,
             data_generation_methods=data_generation_methods,
+            generation_config=generation_config,
+            output_config=output_config,
             code_sample_style=code_sample_style,
             location=pathlib.Path(path).absolute().as_uri(),
             rate_limit=rate_limit,
+            sanitize_output=sanitize_output,
             __expects_json=_is_json_path(path),
+            __expects_yaml=_is_yaml_path(path),
         )
 
 
@@ -95,27 +121,35 @@ def from_uri(
     uri: str,
     *,
     app: Any = None,
-    base_url: Optional[str] = None,
-    port: Optional[int] = None,
-    method: Optional[Filter] = None,
-    endpoint: Optional[Filter] = None,
-    tag: Optional[Filter] = None,
-    operation_id: Optional[Filter] = None,
-    skip_deprecated_operations: bool = False,
+    base_url: str | None = None,
+    port: int | None = None,
+    method: Filter | None = None,
+    endpoint: Filter | None = None,
+    tag: Filter | None = None,
+    operation_id: Filter | None = None,
+    skip_deprecated_operations: bool | None = None,
     validate_schema: bool = False,
-    force_schema_version: Optional[str] = None,
+    force_schema_version: str | None = None,
     data_generation_methods: DataGenerationMethodInput = DEFAULT_DATA_GENERATION_METHODS,
+    generation_config: GenerationConfig | None = None,
+    output_config: OutputConfig | None = None,
     code_sample_style: str = CodeSampleStyle.default().name,
-    wait_for_schema: Optional[float] = None,
-    rate_limit: Optional[str] = None,
+    wait_for_schema: float | None = None,
+    rate_limit: str | None = None,
+    sanitize_output: bool = True,
     **kwargs: Any,
 ) -> BaseOpenAPISchema:
     """Load Open API schema from the network.
 
     :param str uri: Schema URL.
     """
-    setup_headers(kwargs)
+    import backoff
+    import requests
+
+    setup_default_headers(kwargs)
     if port:
+        from yarl import URL
+
         uri = str(URL(uri).with_port(port))
         if not base_url:
             base_url = uri
@@ -129,68 +163,79 @@ def from_uri(
             interval=WAIT_FOR_SCHEMA_INTERVAL,
         )
         def _load_schema(_uri: str, **_kwargs: Any) -> requests.Response:
-            return requests.get(_uri, **kwargs)
+            return requests.get(_uri, **_kwargs)
 
     else:
         _load_schema = requests.get
 
-    response = _load_schema(uri, **kwargs)
-    HTTPError.raise_for_status(response)
+    kwargs.setdefault("timeout", DEFAULT_RESPONSE_TIMEOUT / 1000)
+    response = load_schema_from_url(lambda: _load_schema(uri, **kwargs))
+    return from_file(
+        response.text,
+        app=app,
+        base_url=base_url,
+        method=method,
+        endpoint=endpoint,
+        tag=tag,
+        operation_id=operation_id,
+        skip_deprecated_operations=skip_deprecated_operations,
+        validate_schema=validate_schema,
+        force_schema_version=force_schema_version,
+        data_generation_methods=data_generation_methods,
+        generation_config=generation_config,
+        output_config=output_config,
+        code_sample_style=code_sample_style,
+        location=uri,
+        rate_limit=rate_limit,
+        sanitize_output=sanitize_output,
+        __expects_json=_is_json_response(response),
+        __expects_yaml=_is_yaml_response(response),
+    )
+
+
+SCHEMA_INVALID_ERROR = "The provided API schema does not appear to be a valid OpenAPI schema"
+SCHEMA_LOADING_ERROR = "Received unsupported content while expecting a JSON or YAML payload for Open API"
+SCHEMA_SYNTAX_ERROR = "API schema does not appear syntactically valid"
+
+
+def _load_yaml(data: str, include_details_on_error: bool = False) -> dict[str, Any]:
+    import yaml
+
     try:
-        return from_file(
-            response.text,
-            app=app,
-            base_url=base_url,
-            method=method,
-            endpoint=endpoint,
-            tag=tag,
-            operation_id=operation_id,
-            skip_deprecated_operations=skip_deprecated_operations,
-            validate_schema=validate_schema,
-            force_schema_version=force_schema_version,
-            data_generation_methods=data_generation_methods,
-            code_sample_style=code_sample_style,
-            location=uri,
-            rate_limit=rate_limit,
-            __expects_json=_is_json_response(response),
-        )
-    except SchemaLoadingError as exc:
-        content_type = response.headers.get("Content-Type")
-        if content_type is not None:
-            raise SchemaLoadingError(f"{exc.args[0]}. The actual response has `{content_type}` Content-Type") from exc
-        raise
-
-
-SCHEMA_LOADING_ERROR = (
-    "It seems like the schema you are trying to load is malformed. "
-    "Schemathesis expects API schemas in JSON or YAML formats"
-)
-
-
-def _load_yaml(data: str) -> Dict[str, Any]:
-    try:
-        return yaml.load(data, StringDatesYAMLLoader)
+        return load_yaml(data)
     except yaml.YAMLError as exc:
-        raise SchemaLoadingError(SCHEMA_LOADING_ERROR) from exc
+        if include_details_on_error:
+            type_ = SchemaErrorType.SYNTAX_ERROR
+            message = SCHEMA_SYNTAX_ERROR
+            extras = [entry for entry in str(exc).splitlines() if entry]
+        else:
+            type_ = SchemaErrorType.UNEXPECTED_CONTENT_TYPE
+            message = SCHEMA_LOADING_ERROR
+            extras = []
+        raise SchemaError(type_, message, extras=extras) from exc
 
 
 def from_file(
-    file: Union[IO[str], str],
+    file: IO[str] | str,
     *,
     app: Any = None,
-    base_url: Optional[str] = None,
-    method: Optional[Filter] = None,
-    endpoint: Optional[Filter] = None,
-    tag: Optional[Filter] = None,
-    operation_id: Optional[Filter] = None,
-    skip_deprecated_operations: bool = False,
+    base_url: str | None = None,
+    method: Filter | None = None,
+    endpoint: Filter | None = None,
+    tag: Filter | None = None,
+    operation_id: Filter | None = None,
+    skip_deprecated_operations: bool | None = None,
     validate_schema: bool = False,
-    force_schema_version: Optional[str] = None,
+    force_schema_version: str | None = None,
     data_generation_methods: DataGenerationMethodInput = DEFAULT_DATA_GENERATION_METHODS,
+    generation_config: GenerationConfig | None = None,
+    output_config: OutputConfig | None = None,
     code_sample_style: str = CodeSampleStyle.default().name,
-    location: Optional[str] = None,
-    rate_limit: Optional[str] = None,
+    location: str | None = None,
+    rate_limit: str | None = None,
+    sanitize_output: bool = True,
     __expects_json: bool = False,
+    __expects_yaml: bool = False,
     **kwargs: Any,  # needed in the runner to have compatible API across all loaders
 ) -> BaseOpenAPISchema:
     """Load Open API schema from a file descriptor, string or bytes.
@@ -204,13 +249,20 @@ def from_file(
     if __expects_json:
         try:
             raw = json.loads(data)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as exc:
             # Fallback to a slower YAML loader. This way we'll still load schemas from responses with
             # invalid `Content-Type` headers or YAML files that have the `.json` extension.
             # This is a rare case, and it will be slower but trying JSON first improves a more common use case
-            raw = _load_yaml(data)
+            try:
+                raw = _load_yaml(data)
+            except SchemaError:
+                raise SchemaError(
+                    SchemaErrorType.SYNTAX_ERROR,
+                    SCHEMA_SYNTAX_ERROR,
+                    extras=[entry for entry in str(exc).splitlines() if entry],
+                ) from exc
     else:
-        raw = _load_yaml(data)
+        raw = _load_yaml(data, include_details_on_error=__expects_yaml)
     return from_dict(
         raw,
         app=app,
@@ -223,76 +275,134 @@ def from_file(
         validate_schema=validate_schema,
         force_schema_version=force_schema_version,
         data_generation_methods=data_generation_methods,
+        generation_config=generation_config,
+        output_config=output_config,
         code_sample_style=code_sample_style,
         location=location,
         rate_limit=rate_limit,
+        sanitize_output=sanitize_output,
     )
 
 
+def _is_fast_api(app: Any) -> bool:
+    for cls in app.__class__.__mro__:
+        if f"{cls.__module__}.{cls.__qualname__}" == "fastapi.applications.FastAPI":
+            return True
+    return False
+
+
 def from_dict(
-    raw_schema: Dict[str, Any],
+    raw_schema: dict[str, Any],
     *,
     app: Any = None,
-    base_url: Optional[str] = None,
-    method: Optional[Filter] = None,
-    endpoint: Optional[Filter] = None,
-    tag: Optional[Filter] = None,
-    operation_id: Optional[Filter] = None,
-    skip_deprecated_operations: bool = False,
+    base_url: str | None = None,
+    method: Filter | None = None,
+    endpoint: Filter | None = None,
+    tag: Filter | None = None,
+    operation_id: Filter | None = None,
+    skip_deprecated_operations: bool | None = None,
     validate_schema: bool = False,
-    force_schema_version: Optional[str] = None,
+    force_schema_version: str | None = None,
     data_generation_methods: DataGenerationMethodInput = DEFAULT_DATA_GENERATION_METHODS,
+    generation_config: GenerationConfig | None = None,
+    output_config: OutputConfig | None = None,
     code_sample_style: str = CodeSampleStyle.default().name,
-    location: Optional[str] = None,
-    rate_limit: Optional[str] = None,
+    location: str | None = None,
+    rate_limit: str | None = None,
+    sanitize_output: bool = True,
 ) -> BaseOpenAPISchema:
     """Load Open API schema from a Python dictionary.
 
     :param dict raw_schema: A schema to load.
     """
+    from ... import transports
+    from .schemas import OpenApi30, SwaggerV20
+
+    if not isinstance(raw_schema, dict):
+        raise SchemaError(SchemaErrorType.OPEN_API_INVALID_SCHEMA, SCHEMA_INVALID_ERROR)
     _code_sample_style = CodeSampleStyle.from_str(code_sample_style)
     hook_context = HookContext()
+    is_openapi_31 = raw_schema.get("openapi", "").startswith("3.1")
+    is_fast_api_fixup_installed = fixups.is_installed("fast_api")
+    if is_fast_api_fixup_installed and is_openapi_31:
+        fixups.fast_api.uninstall()
+    elif _is_fast_api(app):
+        fixups.fast_api.adjust_schema(raw_schema)
     dispatch("before_load_schema", hook_context, raw_schema)
-    rate_limiter: Optional[Limiter] = None
+    rate_limiter: Limiter | None = None
     if rate_limit is not None:
         rate_limiter = build_limiter(rate_limit)
+
+    for name in ("method", "endpoint", "tag", "operation_id", "skip_deprecated_operations"):
+        value = locals()[name]
+        if value is not None:
+            warn_filtration_arguments(name)
+    filter_set = filter_set_from_components(
+        include=True,
+        method=method,
+        endpoint=endpoint,
+        tag=tag,
+        operation_id=operation_id,
+        skip_deprecated_operations=skip_deprecated_operations,
+    )
 
     def init_openapi_2() -> SwaggerV20:
         _maybe_validate_schema(raw_schema, definitions.SWAGGER_20_VALIDATOR, validate_schema)
         instance = SwaggerV20(
             raw_schema,
+            specification=Specification.OPENAPI,
             app=app,
             base_url=base_url,
-            method=method,
-            endpoint=endpoint,
-            tag=tag,
-            operation_id=operation_id,
-            skip_deprecated_operations=skip_deprecated_operations,
+            filter_set=filter_set,
             validate_schema=validate_schema,
-            data_generation_methods=prepare_data_generation_methods(data_generation_methods),
+            data_generation_methods=DataGenerationMethod.ensure_list(data_generation_methods),
+            generation_config=generation_config or GenerationConfig(),
+            output_config=output_config or OutputConfig(),
             code_sample_style=_code_sample_style,
             location=location,
             rate_limiter=rate_limiter,
+            sanitize_output=sanitize_output,
+            transport=transports.get(app),
         )
         dispatch("after_load_schema", hook_context, instance)
         return instance
 
-    def init_openapi_3() -> OpenApi30:
-        _maybe_validate_schema(raw_schema, definitions.OPENAPI_30_VALIDATOR, validate_schema)
+    def init_openapi_3(forced: bool) -> OpenApi30:
+        version = raw_schema["openapi"]
+        if (
+            not (is_openapi_31 and experimental.OPEN_API_3_1.is_enabled)
+            and not forced
+            and not OPENAPI_30_VERSION_RE.match(version)
+        ):
+            if is_openapi_31:
+                raise SchemaError(
+                    SchemaErrorType.OPEN_API_EXPERIMENTAL_VERSION,
+                    f"The provided schema uses Open API {version}, which is currently not fully supported.",
+                )
+            raise SchemaError(
+                SchemaErrorType.OPEN_API_UNSUPPORTED_VERSION,
+                f"The provided schema uses Open API {version}, which is currently not supported.",
+            )
+        if is_openapi_31:
+            validator = definitions.OPENAPI_31_VALIDATOR
+        else:
+            validator = definitions.OPENAPI_30_VALIDATOR
+        _maybe_validate_schema(raw_schema, validator, validate_schema)
         instance = OpenApi30(
             raw_schema,
+            specification=Specification.OPENAPI,
             app=app,
             base_url=base_url,
-            method=method,
-            endpoint=endpoint,
-            tag=tag,
-            operation_id=operation_id,
-            skip_deprecated_operations=skip_deprecated_operations,
+            filter_set=filter_set,
             validate_schema=validate_schema,
-            data_generation_methods=prepare_data_generation_methods(data_generation_methods),
+            data_generation_methods=DataGenerationMethod.ensure_list(data_generation_methods),
+            generation_config=generation_config or GenerationConfig(),
+            output_config=output_config or OutputConfig(),
             code_sample_style=_code_sample_style,
             location=location,
             rate_limiter=rate_limiter,
+            sanitize_output=sanitize_output,
+            transport=transports.get(app),
         )
         dispatch("after_load_schema", hook_context, instance)
         return instance
@@ -300,37 +410,47 @@ def from_dict(
     if force_schema_version == "20":
         return init_openapi_2()
     if force_schema_version == "30":
-        return init_openapi_3()
+        return init_openapi_3(forced=True)
     if "swagger" in raw_schema:
         return init_openapi_2()
     if "openapi" in raw_schema:
-        return init_openapi_3()
-    raise SchemaLoadingError("Unsupported schema type")
+        return init_openapi_3(forced=False)
+    raise SchemaError(
+        SchemaErrorType.OPEN_API_UNSPECIFIED_VERSION,
+        "Unable to determine the Open API version as it's not specified in the document.",
+    )
 
+
+OPENAPI_30_VERSION_RE = re.compile(r"^3\.0\.\d(-.+)?$")
 
 # It is a common case when API schemas are stored in the YAML format and HTTP status codes are numbers
 # The Open API spec requires HTTP status codes as strings
 DOC_ENTRY = "https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.0.3.md#patterned-fields-1"
-NUMERIC_STATUS_CODES_MESSAGE = f"""The input schema contains HTTP status codes as numbers.
-The Open API spec requires them to be strings:
-{DOC_ENTRY}
+NUMERIC_STATUS_CODES_MESSAGE = f"""Numeric HTTP status codes detected in your YAML schema.
+According to the Open API specification, status codes must be strings, not numbers.
+For more details, check the Open API documentation: {DOC_ENTRY}
+
 Please, stringify the following status codes:"""
-NON_STRING_OBJECT_KEY = "The input schema contains non-string keys in sub-schemas"
+NON_STRING_OBJECT_KEY_MESSAGE = (
+    "The Open API specification requires all keys in the schema to be strings. You have some keys that are not strings."
+)
 
 
-def _format_status_codes(status_codes: List[Tuple[int, List[Union[str, int]]]]) -> str:
+def _format_status_codes(status_codes: list[tuple[int, list[str | int]]]) -> str:
     buffer = io.StringIO()
     for status_code, path in status_codes:
         buffer.write(f" - {status_code} at schema['paths']")
         for chunk in path:
-            buffer.write(f"[{repr(chunk)}]")
+            buffer.write(f"[{chunk!r}]")
         buffer.write("['responses']\n")
     return buffer.getvalue().rstrip()
 
 
 def _maybe_validate_schema(
-    instance: Dict[str, Any], validator: jsonschema.validators.Draft4Validator, validate_schema: bool
+    instance: dict[str, Any], validator: jsonschema.validators.Draft4Validator, validate_schema: bool
 ) -> None:
+    from jsonschema import ValidationError
+
     if validate_schema:
         try:
             validator.validate(instance)
@@ -339,28 +459,37 @@ def _maybe_validate_schema(
                 status_codes = validation.find_numeric_http_status_codes(instance)
                 if status_codes:
                     message = _format_status_codes(status_codes)
-                    raise SchemaLoadingError(f"{NUMERIC_STATUS_CODES_MESSAGE}\n{message}") from exc
+                    raise SchemaError(
+                        SchemaErrorType.YAML_NUMERIC_STATUS_CODES, f"{NUMERIC_STATUS_CODES_MESSAGE}\n{message}"
+                    ) from exc
                 # Some other pattern error
-                raise SchemaLoadingError(NON_STRING_OBJECT_KEY) from exc
-            raise SchemaLoadingError("Invalid schema") from exc
+                raise SchemaError(SchemaErrorType.YAML_NON_STRING_KEYS, NON_STRING_OBJECT_KEY_MESSAGE) from exc
+            raise SchemaError(SchemaErrorType.UNCLASSIFIED, "Unknown error") from exc
         except ValidationError as exc:
-            raise SchemaLoadingError("The input schema is not a valid Open API schema") from exc
+            raise SchemaError(
+                SchemaErrorType.OPEN_API_INVALID_SCHEMA,
+                SCHEMA_INVALID_ERROR,
+                extras=[entry for entry in str(exc).splitlines() if entry],
+            ) from exc
 
 
 def from_pytest_fixture(
     fixture_name: str,
     *,
     app: Any = NOT_SET,
-    base_url: Union[Optional[str], NotSet] = NOT_SET,
-    method: Optional[Filter] = NOT_SET,
-    endpoint: Optional[Filter] = NOT_SET,
-    tag: Optional[Filter] = NOT_SET,
-    operation_id: Optional[Filter] = NOT_SET,
-    skip_deprecated_operations: bool = False,
+    base_url: str | None | NotSet = NOT_SET,
+    method: Filter | None = NOT_SET,
+    endpoint: Filter | None = NOT_SET,
+    tag: Filter | None = NOT_SET,
+    operation_id: Filter | None = NOT_SET,
+    skip_deprecated_operations: bool | None = None,
     validate_schema: bool = False,
-    data_generation_methods: Union[DataGenerationMethodInput, NotSet] = NOT_SET,
+    data_generation_methods: DataGenerationMethodInput | NotSet = NOT_SET,
+    generation_config: GenerationConfig | NotSet = NOT_SET,
+    output_config: OutputConfig | NotSet = NOT_SET,
     code_sample_style: str = CodeSampleStyle.default().name,
-    rate_limit: Optional[str] = None,
+    rate_limit: str | None = None,
+    sanitize_output: bool = True,
 ) -> LazySchema:
     """Load schema from a ``pytest`` fixture.
 
@@ -371,29 +500,42 @@ def from_pytest_fixture(
 
     :param str fixture_name: The name of a fixture to load.
     """
+    from ...lazy import LazySchema
+
     _code_sample_style = CodeSampleStyle.from_str(code_sample_style)
-    _data_generation_methods: Union[DataGenerationMethodInput, NotSet]
+    _data_generation_methods: DataGenerationMethodInput | NotSet
     if data_generation_methods is not NOT_SET:
         data_generation_methods = cast(DataGenerationMethodInput, data_generation_methods)
-        _data_generation_methods = prepare_data_generation_methods(data_generation_methods)
+        _data_generation_methods = DataGenerationMethod.ensure_list(data_generation_methods)
     else:
         _data_generation_methods = data_generation_methods
-    rate_limiter: Optional[Limiter] = None
+    rate_limiter: Limiter | None = None
     if rate_limit is not None:
         rate_limiter = build_limiter(rate_limit)
-    return LazySchema(
-        fixture_name,
-        app=app,
-        base_url=base_url,
+    for name in ("method", "endpoint", "tag", "operation_id", "skip_deprecated_operations"):
+        value = locals()[name]
+        if value is not None:
+            warn_filtration_arguments(name)
+    filter_set = filter_set_from_components(
+        include=True,
         method=method,
         endpoint=endpoint,
         tag=tag,
         operation_id=operation_id,
         skip_deprecated_operations=skip_deprecated_operations,
+    )
+    return LazySchema(
+        fixture_name,
+        app=app,
+        base_url=base_url,
+        filter_set=filter_set,
         validate_schema=validate_schema,
         data_generation_methods=_data_generation_methods,
+        generation_config=generation_config,
+        output_config=output_config,
         code_sample_style=_code_sample_style,
         rate_limiter=rate_limiter,
+        sanitize_output=sanitize_output,
     )
 
 
@@ -401,17 +543,20 @@ def from_wsgi(
     schema_path: str,
     app: Any,
     *,
-    base_url: Optional[str] = None,
-    method: Optional[Filter] = None,
-    endpoint: Optional[Filter] = None,
-    tag: Optional[Filter] = None,
-    operation_id: Optional[Filter] = None,
-    skip_deprecated_operations: bool = False,
+    base_url: str | None = None,
+    method: Filter | None = None,
+    endpoint: Filter | None = None,
+    tag: Filter | None = None,
+    operation_id: Filter | None = None,
+    skip_deprecated_operations: bool | None = None,
     validate_schema: bool = False,
-    force_schema_version: Optional[str] = None,
+    force_schema_version: str | None = None,
     data_generation_methods: DataGenerationMethodInput = DEFAULT_DATA_GENERATION_METHODS,
+    generation_config: GenerationConfig | None = None,
+    output_config: OutputConfig | None = None,
     code_sample_style: str = CodeSampleStyle.default().name,
-    rate_limit: Optional[str] = None,
+    rate_limit: str | None = None,
+    sanitize_output: bool = True,
     **kwargs: Any,
 ) -> BaseOpenAPISchema:
     """Load Open API schema from a WSGI app.
@@ -419,11 +564,14 @@ def from_wsgi(
     :param str schema_path: An in-app relative URL to the schema.
     :param app: A WSGI app instance.
     """
+    from werkzeug.test import Client
+
+    from ...transports.responses import WSGIResponse
+
     require_relative_url(schema_path)
-    setup_headers(kwargs)
+    setup_default_headers(kwargs)
     client = Client(app, WSGIResponse)
-    response = client.get(schema_path, **kwargs)
-    HTTPError.check_response(response, schema_path)
+    response = load_schema_from_url(lambda: client.get(schema_path, **kwargs))
     return from_file(
         response.data,
         app=app,
@@ -436,15 +584,20 @@ def from_wsgi(
         validate_schema=validate_schema,
         force_schema_version=force_schema_version,
         data_generation_methods=data_generation_methods,
+        generation_config=generation_config,
+        output_config=output_config,
         code_sample_style=code_sample_style,
         location=schema_path,
         rate_limit=rate_limit,
+        sanitize_output=sanitize_output,
         __expects_json=_is_json_response(response),
     )
 
 
 def get_loader_for_app(app: Any) -> Callable:
-    if isinstance(app, Starlette):
+    from ...transports.asgi import is_asgi_app
+
+    if is_asgi_app(app):
         return from_asgi
     if app.__class__.__module__.startswith("aiohttp."):
         return from_aiohttp
@@ -455,17 +608,20 @@ def from_aiohttp(
     schema_path: str,
     app: Any,
     *,
-    base_url: Optional[str] = None,
-    method: Optional[Filter] = None,
-    endpoint: Optional[Filter] = None,
-    tag: Optional[Filter] = None,
-    operation_id: Optional[Filter] = None,
-    skip_deprecated_operations: bool = False,
+    base_url: str | None = None,
+    method: Filter | None = None,
+    endpoint: Filter | None = None,
+    tag: Filter | None = None,
+    operation_id: Filter | None = None,
+    skip_deprecated_operations: bool | None = None,
     validate_schema: bool = False,
-    force_schema_version: Optional[str] = None,
+    force_schema_version: str | None = None,
     data_generation_methods: DataGenerationMethodInput = DEFAULT_DATA_GENERATION_METHODS,
+    generation_config: GenerationConfig | None = None,
+    output_config: OutputConfig | None = None,
     code_sample_style: str = CodeSampleStyle.default().name,
-    rate_limit: Optional[str] = None,
+    rate_limit: str | None = None,
+    sanitize_output: bool = True,
     **kwargs: Any,
 ) -> BaseOpenAPISchema:
     """Load Open API schema from an AioHTTP app.
@@ -489,8 +645,11 @@ def from_aiohttp(
         validate_schema=validate_schema,
         force_schema_version=force_schema_version,
         data_generation_methods=data_generation_methods,
+        generation_config=generation_config,
+        output_config=output_config,
         code_sample_style=code_sample_style,
         rate_limit=rate_limit,
+        sanitize_output=sanitize_output,
         **kwargs,
     )
 
@@ -499,17 +658,20 @@ def from_asgi(
     schema_path: str,
     app: Any,
     *,
-    base_url: Optional[str] = None,
-    method: Optional[Filter] = None,
-    endpoint: Optional[Filter] = None,
-    tag: Optional[Filter] = None,
-    operation_id: Optional[Filter] = None,
-    skip_deprecated_operations: bool = False,
+    base_url: str | None = None,
+    method: Filter | None = None,
+    endpoint: Filter | None = None,
+    tag: Filter | None = None,
+    operation_id: Filter | None = None,
+    skip_deprecated_operations: bool | None = None,
     validate_schema: bool = False,
-    force_schema_version: Optional[str] = None,
+    force_schema_version: str | None = None,
     data_generation_methods: DataGenerationMethodInput = DEFAULT_DATA_GENERATION_METHODS,
+    generation_config: GenerationConfig | None = None,
+    output_config: OutputConfig | None = None,
     code_sample_style: str = CodeSampleStyle.default().name,
-    rate_limit: Optional[str] = None,
+    rate_limit: str | None = None,
+    sanitize_output: bool = True,
     **kwargs: Any,
 ) -> BaseOpenAPISchema:
     """Load Open API schema from an ASGI app.
@@ -517,11 +679,12 @@ def from_asgi(
     :param str schema_path: An in-app relative URL to the schema.
     :param app: An ASGI app instance.
     """
+    from starlette_testclient import TestClient as ASGIClient
+
     require_relative_url(schema_path)
-    setup_headers(kwargs)
+    setup_default_headers(kwargs)
     client = ASGIClient(app)
-    response = client.get(schema_path, **kwargs)
-    HTTPError.check_response(response, schema_path)
+    response = load_schema_from_url(lambda: client.get(schema_path, **kwargs))
     return from_file(
         response.text,
         app=app,
@@ -534,8 +697,11 @@ def from_asgi(
         validate_schema=validate_schema,
         force_schema_version=force_schema_version,
         data_generation_methods=data_generation_methods,
+        generation_config=generation_config,
+        output_config=output_config,
         code_sample_style=code_sample_style,
         location=schema_path,
         rate_limit=rate_limit,
+        sanitize_output=sanitize_output,
         __expects_json=_is_json_response(response),
     )

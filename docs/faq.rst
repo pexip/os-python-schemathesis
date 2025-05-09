@@ -15,6 +15,13 @@ This data consists of all possible data types from the JSON schema specification
 We can't guarantee that the generated data will always be accepted by the application under test since there could be validation rules not covered by the API schema.
 If you found that Schemathesis generated something that doesn't fit the API schema, consider `reporting a bug <https://github.com/schemathesis/schemathesis/issues/new?assignees=Stranger6667&labels=Status%3A+Review+Needed%2C+Type%3A+Bug&template=bug_report.md&title=%5BBUG%5D>`_
 
+How many tests does Schemathesis execute for an API operation?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The total number of tests Schemathesis executes is influenced by the API schema's complexity, user-defined settings like ``--hypothesis-max-examples`` for the maximum tests generated, and the test generation phases (``explicit``, ``generate``, ``reuse``, and ``shrink``). 
+The process is designed to optimize coverage within a reasonable test budget rather than aiming for exhaustive coverage. 
+For detailed insights and customization options, refer to our :ref:`data generation docs <data-generation-overview>`.
+
 What kind errors Schemathesis is capable to find?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -49,6 +56,14 @@ Dredd works more in a way that requires you to write some sort of example-based 
 
 There are a lot of features that Dredd has are Schemathesis has not (e.g., API Blueprint support, that powerful hook system, and many more) and probably vice versa.
 Definitely, Schemathesis can learn a lot from Dredd and if you miss any feature that exists in Dredd but doesn't exist in Schemathesis, let us know.
+
+Why are no examples generated in Schemathesis when using ``--hypothesis-phase=explicit``?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The ``--hypothesis-phase=explicit`` option is designed to test only the examples that are explicitly defined in the API schema.
+It avoids generating new examples to maintain predictability and adhere strictly to the documented API behavior.
+
+If you need random examples for API operations without explicit examples, consider using the ``--contrib-openapi-fill-missing-examples`` CLI option.
 
 How should I run Schemathesis?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -96,20 +111,10 @@ The ``case`` object that is injected in each test can be modified, assuming your
 Why does Schemathesis fail to parse my API schema generate by FastAPI?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Because FastAPI uses JSON Draft 7 under the hood (via ``pydantic``), which is not compatible with JSON drafts defined by
-the Open API 2 / 3.0.x versions. It is a `known issue <https://github.com/tiangolo/fastapi/issues/240>`_ on the FastAPI side.
-Schemathesis is more strict in schema handling by default, but we provide optional fixups for this case:
+`FastAPI <https://github.com/tiangolo/fastapi>`_ uses `pydantic <https://github.com/samuelcolvin/pydantic>`_, which in turn uses JSON Schema Draft 7.
+This can lead to compatibility issues as OpenAPI 2.0 and 3.0.x use earlier versions of JSON Schema.
 
-.. code:: python
-
-    import schemathesis
-
-    # will install all available compatibility fixups.
-    schemathesis.fixups.install()
-    # You can also provide a list of fixup names as the first argument
-    # schemathesis.fixups.install(["fast_api"])
-
-For more information, take a look into the "Compatibility" section.
+For detailed solutions, please refer to the :ref:`Compatibility section <compatibility-fastapi>`.
 
 Why Schemathesis generates uniform data for my API schema?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -262,13 +267,68 @@ As an alternative, you could use the ``anyOf`` keyword instead.
 Why Schemathesis does not generate UUIDs for Open API 2.0 / 3.0 even if ``format: uuid`` is specified?
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Open API 2.0 / 3.0 do not declare the ``uuid`` format as built-in, hence it is available as an extension:
+Open API 2.0 / 3.0 do not declare the ``uuid`` format as built-in. You have two options to enable UUID generation:
+
+1. Use an extension:
 
 .. code:: python
 
     from schemathesis.contrib.openapi import formats
 
     formats.uuid.install()
+
+2. Enable experimental support for OpenAPI 3.1, which also activates UUID generation. See the :ref:`Experimental Features <experimental-openapi-31>` section for details.
+
+Why is Schemathesis slower on Windows when using ``localhost``?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When Schemathesis sends a request to ``http://localhost/``, it first attempts to use IPv6. This can cause delays if your server only supports IPv4.
+This is especially problematic on Windows due to an unavoidable 1-second timeout for refused TCP connections, which the OS may retry up to three times.
+On Linux, the connection fails immediately if refused, allowing a quick switch to IPv4.
+
+**Solution**: To avoid this delay, simply use http://127.0.0.1/ instead of http://localhost/. This ensures that Schemathesis will use IPv4 directly.
+
+Why can’t Schemathesis connect to my locally running application when run via Docker on MacOS?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The host has a changing IP address, or none if you have no network access. As a result, the Docker container cannot use ``localhost`` to reach the host machine.
+
+**Solution**: Instead, use ``host.docker.internal`` as the hostname to allow Schemathesis to connect to services running on the host.
+
+How to prevent Schemathesis from generating NULL bytes in strings?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default, Schemathesis generates ``NULL`` bytes for all strings in order to cover more possible edge cases.
+
+**Solution**: To prevent Schemathesis from generating ``NULL`` bytes in strings, you need to set the ``allow_x00`` configuration to ``False``.
+
+CLI:
+
+.. code:: text
+
+    $ st run --generation-allow-x00=false ...
+
+Python:
+
+.. code:: python
+
+    import schemathesis
+    from schemathesis import GenerationConfig
+
+    schema = schemathesis.from_uri(
+        "https://example.schemathesis.io/openapi.json",
+        generation_config=GenerationConfig(allow_x00=False),
+    )
+
+This adjustment ensures that Schemathesis does not include NULL bytes in strings for all your tests, making them compatible with systems that reject such inputs.
+
+How can I use custom authentication methods with Schemathesis?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Schemathesis supports custom authentication through its extensions system.
+
+For detailed instructions on implementing custom authentication methods or using existing libraries for that, 
+refer to our :ref:`Custom Authentication <custom-auth>` and :ref:`Third-party Authentication <third-party-auth>` sections.
 
 Working with API schemas
 ------------------------

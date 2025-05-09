@@ -1,6 +1,6 @@
-import cgi
 import csv
 import json
+import logging
 from time import sleep
 from typing import Tuple
 from uuid import uuid4
@@ -11,16 +11,19 @@ from flask import Flask, Response, jsonify, request
 from werkzeug.exceptions import BadRequest, GatewayTimeout, InternalServerError
 
 from schemathesis.constants import BOM_MARK
+from schemathesis.transports.content_types import parse_content_type
 
 from ..schema import PAYLOAD_VALIDATOR, OpenAPIVersion, make_openapi_schema
+
+logging.getLogger("werkzeug").setLevel(logging.CRITICAL)
 
 SUCCESS_RESPONSE = {"read": "success!"}
 
 
 def expect_content_type(value: str):
     content_type = request.headers["Content-Type"]
-    content_type, _ = cgi.parse_header(content_type)
-    if content_type != value:
+    main, sub = parse_content_type(content_type)
+    if f"{main}/{sub}" != value:
         raise InternalServerError(f"Expected {value} payload")
 
 
@@ -225,7 +228,7 @@ def create_app(
 
     @app.route("/api/malformed_json", methods=["GET"])
     def malformed_json():
-        return Response("{malformed}" + str(uuid4()), content_type="application/json")
+        return Response("{malformed}", content_type="application/json")
 
     @app.route("/api/invalid_response", methods=["GET"])
     def invalid_response():
@@ -238,6 +241,10 @@ def create_app(
         if not request.args["id"].isdigit():
             return jsonify({"detail": "Invalid `id`"}), 400
         return jsonify({"value": request.args["id"]})
+
+    @app.route("/api/ignored_auth", methods=["GET"])
+    def ignored_auth():
+        return jsonify({"has_auth": "Authorization" in request.headers})
 
     @app.route("/api/invalid_path_parameter/<id>", methods=["GET"])
     def invalid_path_parameter(id):

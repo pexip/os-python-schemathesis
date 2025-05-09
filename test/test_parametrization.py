@@ -1,11 +1,13 @@
+import sys
+
 import pytest
-from hypothesis import HealthCheck, assume, given, settings
+from hypothesis import HealthCheck, Phase, assume, given, settings
 from packaging import version
 
 import schemathesis
 from schemathesis.parameters import PayloadAlternatives
 
-from .utils import integer
+from .utils import assert_requests_call, integer
 
 
 def test_parametrization(testdir):
@@ -190,7 +192,7 @@ def test(request, case):
 
 @pytest.mark.parametrize(
     "schema",
-    (
+    [
         {
             "openapi": "3.0.2",
             "info": {"title": "Test", "description": "Test", "version": "0.1.0"},
@@ -227,7 +229,7 @@ def test(request, case):
                 }
             },
         },
-    ),
+    ],
 )
 def test_specified_example_query(testdir, schema):
     # When the given query parameter contains an example
@@ -260,7 +262,7 @@ from hypothesis import Phase
 @settings(max_examples=1, phases=[Phase.explicit])
 def test(request, case):
     request.config.HYPOTHESIS_CASES += 1
-    assert case.query == {"id": "test"}
+    assert case.query in ({"id": "test1"}, {"id": "test2"})
 """,
         schema={
             "openapi": "3.0.2",
@@ -273,8 +275,8 @@ def test(request, case):
                                 "name": "id",
                                 "in": "query",
                                 "required": True,
-                                "example": "test",
-                                "schema": {"type": "string", "example": "NOT test"},
+                                "example": "test1",
+                                "schema": {"type": "string", "example": "test2"},
                             }
                         ],
                         "responses": {"200": {"description": "OK"}},
@@ -287,7 +289,7 @@ def test(request, case):
     result = testdir.runpytest("-v", "-s")
     # Then this example should be used in tests
     result.assert_outcomes(passed=1)
-    result.stdout.re_match_lines([r"Hypothesis calls: 1$"])
+    result.stdout.re_match_lines([r"Hypothesis calls: 2$"])
 
 
 def test_specified_example_body_media_type_override(testdir):
@@ -300,7 +302,7 @@ from hypothesis import Phase
 @settings(max_examples=1, phases=[Phase.explicit])
 def test(request, case):
     request.config.HYPOTHESIS_CASES += 1
-    assert case.body == {"name": "John"}
+    assert case.body in ({"name": "John1"}, {"name": "John2"})
 """,
         schema={
             "openapi": "3.0.2",
@@ -315,9 +317,9 @@ def test(request, case):
                                         "type": "object",
                                         "properties": {"name": {"type": "string"}},
                                         "required": ["name"],
-                                        "example": {"name": "NOT John"},
+                                        "example": {"name": "John1"},
                                     },
-                                    "example": {"name": "John"},
+                                    "example": {"name": "John2"},
                                 }
                             }
                         },
@@ -331,7 +333,7 @@ def test(request, case):
     result = testdir.runpytest("-v", "-s")
     # Then this example should be used in tests, not the example from the schema
     result.assert_outcomes(passed=1)
-    result.stdout.re_match_lines([r"Hypothesis calls: 1$"])
+    result.stdout.re_match_lines([r"Hypothesis calls: 2$"])
 
 
 def test_multiple_examples_different_locations(testdir):
@@ -344,7 +346,7 @@ from hypothesis import Phase
 @settings(max_examples=1, phases=[Phase.explicit])
 def test(request, case):
     request.config.HYPOTHESIS_CASES += 1
-    assert case.body == {"name": "John"}
+    assert case.body in ({"name": "John1"}, {"name": "John2"})
     assert case.query == {"age": 35}
 """,
         schema={
@@ -360,9 +362,9 @@ def test(request, case):
                                         "type": "object",
                                         "properties": {"name": {"type": "string"}},
                                         "required": ["name"],
-                                        "example": {"name": "NOT John"},
+                                        "example": {"name": "John1"},
                                     },
-                                    "example": {"name": "John"},
+                                    "example": {"name": "John2"},
                                 }
                             }
                         },
@@ -377,7 +379,7 @@ def test(request, case):
     result = testdir.runpytest("-v", "-s")
     # Then these examples should be used in tests as a part of a single request, i.e. combined
     result.assert_outcomes(passed=1)
-    result.stdout.re_match_lines([r"Hypothesis calls: 1$"])
+    result.stdout.re_match_lines([r"Hypothesis calls: 2$"])
 
 
 def test_multiple_examples_same_location(testdir):
@@ -390,7 +392,7 @@ from hypothesis import Phase
 @settings(max_examples=1, phases=[Phase.explicit])
 def test(request, case):
     request.config.HYPOTHESIS_CASES += 1
-    assert case.formatted_path == "/users/1/2"
+    assert case.formatted_path in ("/users/1/2", "/users/42/43")
 """,
         schema_name="simple_openapi.yaml",
         paths={
@@ -398,14 +400,14 @@ def test(request, case):
                 "post": {
                     "parameters": [
                         {
-                            "schema": {"type": "integer", "example": 42},  # This example should be overridden
+                            "schema": {"type": "integer", "example": 42},
                             "in": "path",
                             "name": "a",
                             "required": True,
                             "example": 1,
                         },
                         {
-                            "schema": {"type": "integer", "example": 43},  # and this one too
+                            "schema": {"type": "integer", "example": 43},
                             "in": "path",
                             "name": "b",
                             "required": True,
@@ -420,9 +422,10 @@ def test(request, case):
     result = testdir.runpytest("-v", "-s")
     # Then these examples should be used combined in tests
     result.assert_outcomes(passed=1)
-    result.stdout.re_match_lines([r"Hypothesis calls: 1$"])
+    result.stdout.re_match_lines([r"Hypothesis calls: 2$"])
 
 
+@pytest.mark.skipif(sys.version_info < (3, 9), reason="Decorator syntax available from Python 3.9")
 def test_deselecting(testdir):
     # When pytest selecting is applied via "-k" option
     testdir.make_test(
@@ -432,7 +435,7 @@ def test_deselecting(testdir):
 def test_a(request, case):
     request.config.HYPOTHESIS_CASES += 1
 
-@schema.parametrize(endpoint="pets")
+@schema.include(path_regex="pets").parametrize()
 @settings(max_examples=1)
 def test_b(request, case):
     request.config.HYPOTHESIS_CASES += 1
@@ -492,11 +495,11 @@ def test_b(request, case):
 
 
 @pytest.mark.parametrize(
-    "schema_name, paths",
-    (
+    ("schema_name", "paths"),
+    [
         ("simple_swagger.yaml", {"/users": {"x-handler": "foo"}}),
         ("simple_openapi.yaml", {"/users": {"x-handler": "foo", "description": "Text"}}),
-    ),
+    ],
 )
 def test_custom_properties(testdir, schema_name, paths):
     # When custom properties are present in operation definitions (e.g. vendor extensions, or some other allowed fields)
@@ -540,7 +543,7 @@ def test_(request, case):
     result.stdout.re_match_lines([r".*Error during collection$"])
 
 
-@pytest.mark.parametrize("as_kwarg", (True, False))
+@pytest.mark.parametrize("as_kwarg", [True, False])
 def test_invalid_schema_with_parametrize(testdir, as_kwarg):
     # When the given schema is not valid but validation is disabled via validate_schema=False argument
     testdir.make_test(
@@ -549,9 +552,7 @@ def test_invalid_schema_with_parametrize(testdir, as_kwarg):
 @settings(max_examples=1)
 def test_(request, case):
     request.config.HYPOTHESIS_CASES += 1
-""".format(
-            "" if not as_kwarg else "validate_schema=False"
-        ),
+""".format("" if not as_kwarg else "validate_schema=False"),
         validate_schema=False,
         schema_name="simple_openapi.yaml",
         paths={
@@ -602,7 +603,7 @@ def test_(request, case):
     result = testdir.runpytest("-v", "-rf")
     # Then the tests should fail with the relevant error message
     result.assert_outcomes(failed=1)
-    result.stdout.re_match_lines([r".*InvalidSchema: Cannot have max_size=6 < min_size=10"])
+    result.stdout.re_match_lines([r".*OperationSchemaError: Cannot have max_size=6 < min_size=10"])
 
 
 def test_invalid_operation(testdir):
@@ -707,6 +708,47 @@ def test_loose_multipart_definition():
 
 
 @pytest.mark.hypothesis_nested
+def test_multipart_behind_a_reference():
+    # When the schema of "multipart/form-data" is behind a reference
+    raw_schema = {
+        "openapi": "3.0.2",
+        "info": {"title": "Test", "description": "Test", "version": "0.1.0"},
+        "paths": {
+            "/body": {
+                "post": {
+                    "requestBody": {
+                        "$ref": "#/components/requestBodies/MultipartBody",
+                    },
+                    "responses": {"200": {"description": "OK"}},
+                }
+            }
+        },
+        "components": {
+            "requestBodies": {
+                "MultipartBody": {
+                    "content": {"multipart/form-data": {"schema": {"properties": {"foo": {"type": "string"}}}}},
+                    "required": True,
+                }
+            }
+        },
+    }
+    schema = schemathesis.from_dict(raw_schema, validate_schema=True)
+    # Then it should be correctly resolved
+
+    @given(case=schema["/body"]["POST"].as_strategy())
+    @settings(
+        max_examples=5,
+        deadline=None,
+        suppress_health_check=[HealthCheck.too_slow, HealthCheck.filter_too_much],
+        phases=[Phase.generate],
+    )
+    def test(case):
+        assert_requests_call(case)
+
+    test()
+
+
+@pytest.mark.hypothesis_nested
 @pytest.mark.operations("multipart")
 def test_optional_form_parameters(schema_url):
     # When form parameters are optional
@@ -802,4 +844,5 @@ def test_(case):
     )
     result = testdir.runpytest()
     # Then it should be reported as any other test failure
-    assert "E           1. Request timed out after 1.00ms" in result.outlines
+    assert "E           1. Response timeout" in result.outlines
+    assert "E           The server failed to respond within the specified limit of 1.00ms" in result.outlines

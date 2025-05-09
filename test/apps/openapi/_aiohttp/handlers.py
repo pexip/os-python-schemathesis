@@ -1,14 +1,16 @@
+from __future__ import annotations
+
 import asyncio
-import cgi
 import csv
-import io
-from typing import Dict
+import json
 from uuid import uuid4
 
 import jsonschema
 from aiohttp import web
 
 from schemathesis.constants import BOM_MARK
+from schemathesis.internal.output import MAX_PAYLOAD_SIZE
+from schemathesis.transports.content_types import parse_content_type
 
 try:
     from ..schema import PAYLOAD_VALIDATOR
@@ -18,8 +20,8 @@ except (ImportError, ValueError):
 
 async def expect_content_type(request: web.Request, value: str):
     content_type = request.headers.get("Content-Type", "")
-    content_type, _ = cgi.parse_header(content_type)
-    if content_type != value:
+    main, sub = parse_content_type(content_type)
+    if f"{main}/{sub}" != value:
         raise web.HTTPInternalServerError(text=f"Expected {value} payload")
     return await request.read()
 
@@ -47,6 +49,16 @@ async def empty(request: web.Request) -> web.Response:
 
 async def empty_string(request: web.Request) -> web.Response:
     return web.Response(body="")
+
+
+async def binary(request: web.Request) -> web.Response:
+    return web.Response(
+        body=b"\xa7\xf5=\x18H\xc7\xff'\xf0\xeep\x06M-RX", content_type="application/octet-stream", status=500
+    )
+
+
+async def long(request: web.Request) -> web.Response:
+    return web.Response(body=json.dumps(["A"] * MAX_PAYLOAD_SIZE), content_type="application/json", status=500)
 
 
 async def payload(request: web.Request) -> web.Response:
@@ -110,8 +122,12 @@ async def headers(request: web.Request) -> web.Response:
     return web.json_response(values, headers=values)
 
 
+async def ignored_auth(request: web.Request) -> web.Response:
+    return web.json_response({"has_auth": "Authorization" in request.headers})
+
+
 async def malformed_json(request: web.Request) -> web.Response:
-    return web.Response(body="{malformed}" + str(uuid4()), content_type="application/json")
+    return web.Response(body="{malformed}", content_type="application/json")
 
 
 async def failure(request: web.Request) -> web.Response:
@@ -161,23 +177,18 @@ async def multiple_failures(request: web.Request) -> web.Response:
     return web.json_response({"result": "OK"})
 
 
-def _decode_multipart(content: bytes, content_type: str) -> Dict[str, str]:
-    # a simplified version of multipart encoding that satisfies testing purposes
-    _, options = cgi.parse_header(content_type)
-    options["boundary"] = options["boundary"].encode()
-    options["CONTENT-LENGTH"] = len(content)
-    return {
-        key: value[0].decode() if isinstance(value[0], bytes) else value[0]
-        for key, value in cgi.parse_multipart(io.BytesIO(content), options).items()
-    }
-
-
 async def multipart(request: web.Request) -> web.Response:
     if not request.headers.get("Content-Type", "").startswith("multipart/"):
         raise web.HTTPBadRequest(text="Not a multipart request!")
-    # We need to have payload stored in the request, thus can't use `request.multipart` that consumes the reader
-    content = await request.read()
-    data = _decode_multipart(content, request.headers["Content-Type"])
+    raw_payload = await request.read()
+    multipart_reader = await request.multipart()
+    multipart_reader._content._buffer.append(raw_payload)
+    data = {}
+    while True:
+        part = await multipart_reader.next()
+        if part is None:
+            break
+        data[part.name] = (await part.read()).decode("utf-8")
     return web.json_response(data)
 
 
@@ -193,6 +204,14 @@ async def write_only(request: web.Request) -> web.Response:
     if len(data) == 1 and isinstance(data["write"], int):
         return web.json_response(SUCCESS_RESPONSE)
     raise web.HTTPInternalServerError
+
+
+async def always_incorrect(request: web.Request) -> web.Response:
+    raise web.HTTPBadRequest(text='{"detail": "Always incorrect"}')
+
+
+async def always_incorrect_options(request: web.Request) -> web.Response:
+    return web.Response(status=200)
 
 
 async def upload_file(request: web.Request) -> web.Response:

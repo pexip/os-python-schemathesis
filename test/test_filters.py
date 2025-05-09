@@ -1,25 +1,21 @@
 import pytest
 
-from schemathesis.constants import IS_PYTEST_ABOVE_54
-
 from .utils import integer
 
 
-@pytest.mark.parametrize("endpoint", ("'/foo'", "'/v1/foo'", ["/foo"], "'/.*oo'"))
+@pytest.mark.parametrize("endpoint", ["'/foo'", "'/v1/foo'", ["/foo"], "'/.*oo'"])
 def test_endpoint_filter(testdir, endpoint):
     # When `endpoint` is specified
     parameters = {"parameters": [integer(name="id", required=True)], "responses": {"200": {"description": "OK"}}}
     testdir.make_test(
-        """
-@schema.parametrize(endpoint={})
+        f"""
+@schema.parametrize(endpoint={endpoint})
 @settings(max_examples=5)
 def test_(request, case):
     request.config.HYPOTHESIS_CASES += 1
     assert case.full_path == "/v1/foo"
     assert case.method == "GET"
-""".format(
-            endpoint
-        ),
+""",
         paths={"/foo": {"get": parameters}, "/bar": {"get": parameters}},
     )
     result = testdir.runpytest("-v", "-s")
@@ -28,21 +24,19 @@ def test_(request, case):
     result.stdout.re_match_lines([r"test_endpoint_filter.py::test_[GET /v1/foo] PASSED"])
 
 
-@pytest.mark.parametrize("method", ("'get'", "'GET'", ["GET"], ["get"]))
+@pytest.mark.parametrize("method", ["'get'", "'GET'", ["GET"], ["get"]])
 def test_method_filter(testdir, method):
     # When `method` is specified
     parameters = {"parameters": [integer(name="id", required=True)], "responses": {"200": {"description": "OK"}}}
     testdir.make_test(
-        """
-@schema.parametrize(method={})
+        f"""
+@schema.parametrize(method={method})
 @settings(max_examples=1)
 def test_(request, case):
     request.config.HYPOTHESIS_CASES += 1
     assert case.full_path in ("/v1/foo", "/v1/users")
     assert case.method == "GET"
-""".format(
-            method
-        ),
+""",
         paths={"/foo": {"get": parameters}, "/bar": {"post": parameters}},
     )
     result = testdir.runpytest("-v", "-s")
@@ -101,7 +95,7 @@ def test_(request, case):
             },
         },
         method="POST",
-        endpoint="/v1/foo",
+        path="/v1/foo",
     )
     result = testdir.runpytest("-v", "-s")
     result.assert_outcomes(passed=1)
@@ -135,7 +129,7 @@ def test_b(request, case):
             }
         },
         method="POST",
-        endpoint="/v1/foo",
+        path="/v1/foo",
         tag="foo",
     )
     result = testdir.runpytest("-v", "-s")
@@ -206,11 +200,7 @@ def test_(request, case):
     )
     result = testdir.runpytest("-v")
     # Then it should be an error
-    if IS_PYTEST_ABOVE_54:
-        key = "errors"
-    else:
-        key = "error"
-    result.assert_outcomes(**{key: 1})
+    result.assert_outcomes(errors=1)
     result.stdout.re_match_lines(
         [
             r"E *Failed: Test function test_error_on_no_matches.py::test_ does not "

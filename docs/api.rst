@@ -6,6 +6,12 @@ Checks
 
 .. autofunction:: schemathesis.check
 
+Data Generation
+~~~~~~~~~~~~~~~
+
+.. autoclass:: schemathesis.GenerationConfig
+   :members:
+
 Fixups
 ~~~~~~
 
@@ -33,7 +39,7 @@ Authentication
 Hooks
 ~~~~~
 
-.. autoclass:: schemathesis.hooks.HookContext
+.. autoclass:: schemathesis.HookContext
    :members:
 
 These functions affect Schemathesis behavior globally:
@@ -42,7 +48,7 @@ These functions affect Schemathesis behavior globally:
 .. autofunction:: schemathesis.hooks.unregister
 .. autofunction:: schemathesis.hooks.unregister_all
 
-.. class:: schemathesis.schemas.BaseSchema
+.. class:: schemathesis.BaseSchema
   :noindex:
 
   All functions above can be accessed via ``schema.hooks.<function-name>`` on a schema instance. Such calls will affect
@@ -81,12 +87,6 @@ Targeted testing
    :members:
 .. autofunction:: schemathesis.target
 
-Custom strategies for Open API "format" keyword
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-.. autofunction:: schemathesis.openapi.format
-
-
 Custom scalars for GraphQL
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -103,14 +103,27 @@ Loaders
 .. autofunction:: schemathesis.from_pytest_fixture
 .. autofunction:: schemathesis.from_uri
 .. autofunction:: schemathesis.from_wsgi
+.. autofunction:: schemathesis.graphql.from_path
 .. autofunction:: schemathesis.graphql.from_dict
+.. autofunction:: schemathesis.graphql.from_file
 .. autofunction:: schemathesis.graphql.from_url
+.. autofunction:: schemathesis.graphql.from_asgi
 .. autofunction:: schemathesis.graphql.from_wsgi
+
+Sanitizing Output
+~~~~~~~~~~~~~~~~~
+
+.. autoclass:: schemathesis.sanitization.Config()
+
+  .. automethod:: with_keys_to_sanitize
+  .. automethod:: without_keys_to_sanitize
+  .. automethod:: with_sensitive_markers
+  .. automethod:: without_sensitive_markers
 
 Schema
 ~~~~~~
 
-.. autoclass:: schemathesis.schemas.BaseSchema()
+.. autoclass:: schemathesis.BaseSchema()
 
   .. automethod:: parametrize
   .. automethod:: given

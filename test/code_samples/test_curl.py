@@ -1,50 +1,75 @@
-from test.apps.openapi._fastapi.app import app
-
 import pytest
+from hypothesis import HealthCheck, given, settings
 
 import schemathesis
-from schemathesis import Case
-from schemathesis.constants import SCHEMATHESIS_TEST_CASE_HEADER
+from schemathesis.models import Case
+from test.apps.openapi._fastapi import create_app
+from test.apps.openapi._fastapi.app import app
 
-schema = schemathesis.from_dict(app.openapi())
+schema = schemathesis.from_dict(app.openapi(), force_schema_version="30")
 
 
-@pytest.mark.parametrize("headers", (None, {"X-Key": "42"}))
+@pytest.mark.parametrize("headers", [None, {"X-Key": "42"}])
 @schema.parametrize()
-def test_as_curl_command(case: Case, headers):
+@settings(suppress_health_check=[HealthCheck.function_scoped_fixture], deadline=None)
+def test_as_curl_command(case: Case, headers, curl):
     command = case.as_curl_command(headers)
     expected_headers = "" if not headers else " ".join(f" -H '{name}: {value}'" for name, value in headers.items())
-    assert (
-        command
-        == f"curl -X GET{expected_headers} -H '{SCHEMATHESIS_TEST_CASE_HEADER}: {case.id}' http://localhost/users"
+    assert command == f"curl -X GET{expected_headers} http://localhost/users"
+    curl.assert_valid(command)
+
+
+def test_non_utf_8_body(curl):
+    case = Case(
+        operation=schema["/users"]["GET"], generation_time=0.0, body=b"42\xff", media_type="application/octet-stream"
     )
-
-
-def test_non_utf_8_body():
-    case = Case(operation=schema["/users"]["GET"], body=b"42\xff", media_type="application/octet-stream")
     command = case.as_curl_command()
-    assert command == f"curl -X GET -H '{SCHEMATHESIS_TEST_CASE_HEADER}: {case.id}' -d '42�' http://localhost/users"
+    assert command == "curl -X GET -H 'Content-Type: application/octet-stream' -d '42�' http://localhost/users"
+    curl.assert_valid(command)
 
 
-def test_explicit_headers():
+def test_json_payload(curl):
+    new_app = create_app(operations=["create_user"])
+    schema = schemathesis.from_dict(new_app.openapi(), force_schema_version="30")
+    case = Case(
+        operation=schema["/users/"]["POST"], generation_time=0.0, body={"foo": 42}, media_type="application/json"
+    )
+    command = case.as_curl_command()
+    assert command == "curl -X POST -H 'Content-Type: application/json' -d '{\"foo\": 42}' http://localhost/users/"
+    curl.assert_valid(command)
+
+
+def test_explicit_headers(curl):
     # When the generated case contains a header from the list of headers that are ignored by default
     name = "Accept"
     value = "application/json"
-    case = Case(operation=schema["/users"]["GET"], headers={name: value})
+    case = Case(operation=schema["/users"]["GET"], generation_time=0.0, headers={name: value})
     command = case.as_curl_command()
-    assert (
-        command
-        == f"curl -X GET -H '{name}: {value}' -H '{SCHEMATHESIS_TEST_CASE_HEADER}: {case.id}' http://localhost/users"
-    )
+    assert command == f"curl -X GET -H '{name}: {value}' http://localhost/users"
+    curl.assert_valid(command)
 
 
 @pytest.mark.operations("failure")
-def test_cli_output(cli, base_url, schema_url, mock_case_id):
+@pytest.mark.openapi_version("3.0")
+def test_cli_output(cli, base_url, schema_url, curl):
     result = cli.run(schema_url, "--code-sample-style=curl")
     lines = result.stdout.splitlines()
-    assert "Run this cURL command to reproduce this failure: " in lines
-    headers = f"-H '{SCHEMATHESIS_TEST_CASE_HEADER}: {mock_case_id.hex}'"
-    assert f"    curl -X GET {headers} {base_url}/failure" in lines
+    assert "Reproduce with: " in lines
+    line = f"    curl -X GET {base_url}/failure"
+    assert line in lines
+    command = line.strip()
+    curl.assert_valid(command)
+
+
+@pytest.mark.operations("failure")
+@pytest.mark.openapi_version("3.0")
+def test_cli_output_includes_insecure(cli, base_url, schema_url, curl):
+    result = cli.run(schema_url, "--code-sample-style=curl", "--request-tls-verify=false")
+    lines = result.stdout.splitlines()
+    line = f"    curl -X GET --insecure {base_url}/failure"
+    assert line in lines
+    command = line.strip()
+    curl.assert_valid(command)
 
 
 @pytest.mark.operations("failure")
@@ -62,6 +87,18 @@ def test_(case):
     )
     result = testdir.runpytest("-v")
     result.assert_outcomes(passed=1, failed=1)
-    result.stdout.re_match_lines(
-        [r"E +Run this cURL command to reproduce this response:", rf"E + curl -X GET.+ {openapi3_base_url}/failure"]
-    )
+    result.stdout.re_match_lines([r"E +Reproduce with:", rf"E + curl -X GET {openapi3_base_url}/failure"])
+
+
+@pytest.mark.hypothesis_nested
+def test_curl_command_validity(curl, loose_schema):
+    # When the input schema is too loose
+
+    @given(case=loose_schema["/test/{key}"]["POST"].as_strategy())
+    @settings(max_examples=30, suppress_health_check=[HealthCheck.too_slow, HealthCheck.filter_too_much], deadline=None)
+    def test(case):
+        command = case.as_curl_command()
+        # Then generated command should always be syntactically valid
+        curl.assert_valid(command)
+
+    test()

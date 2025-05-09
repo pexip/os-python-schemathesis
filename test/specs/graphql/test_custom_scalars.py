@@ -22,25 +22,66 @@ def test_custom_scalar_graphql():
 scalar Date
 
 type Query {
-  getByDate(created: Date!): Int!
+  getByDate(value: Date!): Int!
 }
 """
     schema = schemathesis.graphql.from_file(raw_schema)
 
-    @given(schema[b""]["POST"].as_strategy())
+    @given(schema["Query"]["getByDate"].as_strategy())
     def test(case):
         # Then scalars should be properly generated
-        assert f'getByDate(created: "{expected}")' in case.body
+        assert f'getByDate(value: "{expected}")' in case.body
 
     test()
 
 
+def test_custom_scalar_in_cli(testdir, cli, snapshot_cli):
+    schema_file = testdir.make_graphql_schema_file(
+        """
+scalar FooBar
+
+type Query {
+  getByDate(value: FooBar!): Int!
+}
+    """,
+    )
+    assert cli.run(str(schema_file), "--dry-run") == snapshot_cli
+
+
+def test_built_in_scalars_in_cli(testdir, cli, snapshot_cli):
+    schema_file = testdir.make_graphql_schema_file(
+        """
+scalar Date
+scalar Time
+scalar DateTime
+scalar IP
+scalar IPv4
+scalar IPv6
+scalar BigInt
+scalar Long
+scalar UUID
+
+type Query {
+  getByDate(value: Date!): Int!
+  getByTime(value: Time!): Int!
+  getByDateTime(value: DateTime!): Int!
+  getByIP(value: IP!): Int!
+  getByIPv4(value: IPv4!): Int!
+  getByIPv6(value: IPv6!): Int!
+  getByLong(value: Long!): Int!
+  getByBigInt(value: BigInt!): Int!
+  getByUUID(value: UUID!): Int!
+}""",
+    )
+    assert cli.run(str(schema_file), "--dry-run", "--hypothesis-max-examples=5") == snapshot_cli
+
+
 @pytest.mark.parametrize(
-    "name, value, expected",
-    (
+    ("name", "value", "expected"),
+    [
         (42, st.just("foo").map(nodes.String), "Scalar name 42 must be a string"),
         ("Date", 42, "42 must be a Hypothesis strategy which generates AST nodes matching this scalar"),
-    ),
+    ],
 )
 def test_invalid_strategy(name, value, expected):
     with pytest.raises(UsageError, match=expected):

@@ -2,55 +2,60 @@ import pytest
 from _pytest.main import ExitCode
 
 
-def test_wsgi_app(testdir, cli):
-    module = testdir.make_importable_pyfile(
-        location="""
-        from fastapi import FastAPI
-        from fastapi import HTTPException
-
-        app = FastAPI()
-
-        @app.get("/api/success")
-        async def success():
-            return {"success": True}
-
-        @app.get("/api/failure")
-        async def failure():
-            raise HTTPException(status_code=500)
-            return {"failure": True}
+def test_wsgi_app(ctx, cli):
+    module = ctx.write_pymodule(
         """
+from fastapi import FastAPI
+from fastapi import HTTPException
+
+app = FastAPI()
+
+@app.get("/api/success")
+async def success():
+    return {"success": True}
+
+@app.get("/api/failure")
+async def failure():
+    raise HTTPException(status_code=500)
+    return {"failure": True}
+"""
     )
-    result = cli.run("/openapi.json", "--app", f"{module.purebasename}:app")
+    result = cli.run("/openapi.json", "--app", f"{module}:app", "--force-schema-version=30")
     assert result.exit_code == ExitCode.TESTS_FAILED, result.stdout
     assert "1 passed, 1 failed in" in result.stdout
 
 
-@pytest.mark.parametrize("workers", (1, 2))
-def test_cli_run_output_success(testdir, cli, workers):
-    module = testdir.make_importable_pyfile(
-        location="""
-            from fastapi import FastAPI
-            from fastapi import HTTPException
+@pytest.mark.parametrize("workers", [1, 2])
+def test_cli_run_output_success(ctx, cli, workers):
+    module = ctx.write_pymodule(
+        """
+from fastapi import FastAPI
+from fastapi import HTTPException
 
-            app = FastAPI()
+app = FastAPI()
 
-            @app.get("/api/success")
-            async def success():
-                return {"success": True}
+@app.get("/api/success")
+async def success():
+    return {"success": True}
 
-            """
+"""
     )
     result = cli.run(
-        "/openapi.json", "--app", f"{module.purebasename}:app", f"--workers={workers}", "--show-errors-tracebacks"
+        "/openapi.json",
+        "--app",
+        f"{module}:app",
+        f"--workers={workers}",
+        "--show-trace",
+        "--force-schema-version=30",
     )
 
     assert result.exit_code == ExitCode.OK, result.stdout
     lines = result.stdout.split("\n")
-    assert lines[4] == f"Workers: {workers}"
+    assert lines[5] == f"Workers: {workers}"
     if workers == 1:
-        assert lines[7].startswith("GET /api/success .")
+        assert lines[11].startswith("GET /api/success .")
     else:
-        assert lines[7] == "."
+        assert lines[11] == "."
     assert " HYPOTHESIS OUTPUT " not in result.stdout
     assert " SUMMARY " in result.stdout
 

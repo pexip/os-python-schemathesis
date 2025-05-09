@@ -1,106 +1,54 @@
-import re
-import string
-from base64 import b64encode
+from __future__ import annotations
+
+import time
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Optional
 from urllib.parse import quote_plus
 from weakref import WeakKeyDictionary
 
+from hypothesis import reject
 from hypothesis import strategies as st
 from hypothesis_jsonschema import from_schema
-from requests.auth import _basic_auth_str
 from requests.structures import CaseInsensitiveDict
+from requests.utils import to_key_val_list
 
-from ... import auths, serializers, utils
-from ...constants import DataGenerationMethod
-from ...exceptions import InvalidSchema, SerializationNotPossible
-from ...hooks import GLOBAL_HOOK_DISPATCHER, HookContext, HookDispatcher
-from ...models import APIOperation, Case, cant_serialize
+from ... import auths, serializers
+from ..._hypothesis import prepare_urlencoded
+from ...constants import NOT_SET
+from ...exceptions import BodyInGetRequestError, SerializationNotPossible
+from ...generation import DataGenerationMethod, GenerationConfig
+from ...hooks import HookContext, HookDispatcher, apply_to_all_dispatchers
+from ...internal.copy import fast_deepcopy
+from ...internal.validation import is_illegal_surrogate
+from ...models import APIOperation, Case, GenerationMetadata, TestPhase, cant_serialize
+from ...transports.content_types import parse_content_type
+from ...transports.headers import has_invalid_characters, is_latin_1_encodable
 from ...types import NotSet
-from ...utils import NOT_SET, compose, fast_deepcopy, skip
+from ...utils import skip
 from .constants import LOCATION_TO_CONTAINER
+from .formats import HEADER_FORMAT, STRING_FORMATS, get_default_format_strategies, header_values
+from .media_types import MEDIA_TYPES
 from .negative import negative_schema
 from .negative.utils import can_negate
-from .parameters import OpenAPIBody, parameters_to_json_schema
+from .parameters import OpenAPIBody, OpenAPIParameter, parameters_to_json_schema
 from .utils import is_header_location
 
-HEADER_FORMAT = "_header_value"
-PARAMETERS = frozenset(("path_parameters", "headers", "cookies", "query", "body"))
 SLASH = "/"
-STRING_FORMATS: Dict[str, st.SearchStrategy] = {}
-StrategyFactory = Callable[[Dict[str, Any], str, str, Optional[str]], st.SearchStrategy]
+StrategyFactory = Callable[[Dict[str, Any], str, str, Optional[str], GenerationConfig], st.SearchStrategy]
 
 
-def register_string_format(name: str, strategy: st.SearchStrategy) -> None:
-    """Register a new strategy for generating data for specific string "format".
-
-    :param str name: Format name. It should correspond the one used in the API schema as the "format" keyword value.
-    :param strategy: Hypothesis strategy you'd like to use to generate values for this format.
-    """
-    if not isinstance(name, str):
-        raise TypeError(f"name must be of type {str}, not {type(name)}")
-    if not isinstance(strategy, st.SearchStrategy):
-        raise TypeError(f"strategy must be of type {st.SearchStrategy}, not {type(strategy)}")
-
-    STRING_FORMATS[name] = strategy
-
-
-def unregister_string_format(name: str) -> None:
-    """Remove format strategy from the registry."""
-    try:
-        del STRING_FORMATS[name]
-    except KeyError as exc:
-        raise ValueError(f"Unknown Open API format: {name}") from exc
-
-
-def init_default_strategies() -> None:
-    """Register all default "format" strategies."""
-    register_string_format("binary", st.binary())
-    register_string_format("byte", st.binary().map(lambda x: b64encode(x).decode()))
-
-    def make_basic_auth_str(item: Tuple[str, str]) -> str:
-        return _basic_auth_str(*item)
-
-    latin1_text = st.text(alphabet=st.characters(min_codepoint=0, max_codepoint=255))
-
-    # RFC 7230, Section 3.2.6
-    register_string_format(
-        "_header_name",
-        st.text(min_size=1, alphabet=st.sampled_from("!#$%&'*+-.^_`|~" + string.digits + string.ascii_letters)),
-    )
-    # Define valid characters here to avoid filtering them out in `is_valid_header` later
-    header_value = st.text(alphabet=st.characters(min_codepoint=0, max_codepoint=255, blacklist_characters="\n\r"))
-    # Header values with leading non-visible chars can't be sent with `requests`
-    register_string_format(HEADER_FORMAT, header_value.map(str.lstrip))
-    register_string_format("_basic_auth", st.tuples(latin1_text, latin1_text).map(make_basic_auth_str))  # type: ignore
-    register_string_format(
-        "_bearer_auth",
-        header_value.map("Bearer {}".format),
-    )
-
-
-def is_valid_header(headers: Dict[str, Any]) -> bool:
+def is_valid_header(headers: dict[str, Any]) -> bool:
     """Verify if the generated headers are valid."""
     for name, value in headers.items():
-        if not utils.is_latin_1_encodable(value):
+        if not is_latin_1_encodable(value):
             return False
-        if utils.has_invalid_characters(name, value):
+        if has_invalid_characters(name, value):
             return False
     return True
 
 
-SURROGATE_PAIR_RE = re.compile(r"[\ud800-\udfff]")
-has_surrogate_pair = SURROGATE_PAIR_RE.search
-
-
-def is_illegal_surrogate(item: Any) -> bool:
-    if isinstance(item, list):
-        return any(isinstance(item_, str) and bool(has_surrogate_pair(item_)) for item_ in item)
-    return isinstance(item, str) and bool(has_surrogate_pair(item))
-
-
-def is_valid_query(query: Dict[str, Any]) -> bool:
+def is_valid_query(query: dict[str, Any]) -> bool:
     """Surrogates are not allowed in a query string.
 
     `requests` and `werkzeug` will fail to send it to the application.
@@ -111,18 +59,33 @@ def is_valid_query(query: Dict[str, Any]) -> bool:
     return True
 
 
+def is_valid_urlencoded(data: Any) -> bool:
+    if data is NOT_SET:
+        return True
+    try:
+        for _, __ in to_key_val_list(data):  # type: ignore[no-untyped-call]
+            pass
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 @st.composite  # type: ignore
 def get_case_strategy(
     draw: Callable,
     operation: APIOperation,
-    hooks: Optional[HookDispatcher] = None,
-    auth_storage: Optional[auths.AuthStorage] = None,
+    hooks: HookDispatcher | None = None,
+    auth_storage: auths.AuthStorage | None = None,
     generator: DataGenerationMethod = DataGenerationMethod.default(),
-    path_parameters: Union[NotSet, Dict[str, Any]] = NOT_SET,
-    headers: Union[NotSet, Dict[str, Any]] = NOT_SET,
-    cookies: Union[NotSet, Dict[str, Any]] = NOT_SET,
-    query: Union[NotSet, Dict[str, Any]] = NOT_SET,
+    generation_config: GenerationConfig | None = None,
+    path_parameters: NotSet | dict[str, Any] = NOT_SET,
+    headers: NotSet | dict[str, Any] = NOT_SET,
+    cookies: NotSet | dict[str, Any] = NOT_SET,
+    query: NotSet | dict[str, Any] = NOT_SET,
     body: Any = NOT_SET,
+    media_type: str | None = None,
+    skip_on_not_negated: bool = True,
+    phase: TestPhase = TestPhase.GENERATE,
 ) -> Any:
     """A strategy that creates `Case` instances.
 
@@ -136,16 +99,20 @@ def get_case_strategy(
     The primary purpose of this behavior is to prevent sending incomplete explicit examples by generating missing parts
     as it works with `body`.
     """
+    start = time.monotonic()
     strategy_factory = DATA_GENERATION_METHOD_TO_STRATEGY_FACTORY[generator]
 
     context = HookContext(operation)
 
-    path_parameters_ = generate_parameter("path", path_parameters, operation, draw, context, hooks, generator)
-    headers_ = generate_parameter("header", headers, operation, draw, context, hooks, generator)
-    cookies_ = generate_parameter("cookie", cookies, operation, draw, context, hooks, generator)
-    query_ = generate_parameter("query", query, operation, draw, context, hooks, generator)
+    generation_config = generation_config or operation.schema.generation_config
 
-    media_type = None
+    path_parameters_ = generate_parameter(
+        "path", path_parameters, operation, draw, context, hooks, generator, generation_config
+    )
+    headers_ = generate_parameter("header", headers, operation, draw, context, hooks, generator, generation_config)
+    cookies_ = generate_parameter("cookie", cookies, operation, draw, context, hooks, generator, generation_config)
+    query_ = generate_parameter("query", query, operation, draw, context, hooks, generator, generation_config)
+
     if body is NOT_SET:
         if operation.body:
             body_generator = generator
@@ -160,7 +127,7 @@ def get_case_strategy(
             else:
                 candidates = operation.body.items
             parameter = draw(st.sampled_from(candidates))
-            strategy = _get_body_strategy(parameter, strategy_factory, operation)
+            strategy = _get_body_strategy(parameter, strategy_factory, operation, generation_config)
             strategy = apply_hooks(operation, context, hooks, strategy, "body")
             # Parameter may have a wildcard media type. In this case, choose any supported one
             possible_media_types = sorted(serializers.get_matching_media_types(parameter.media_type))
@@ -172,26 +139,30 @@ def get_case_strategy(
                 # Other media types are possible - avoid choosing this media type in the future
                 cant_serialize(parameter.media_type)
             media_type = draw(st.sampled_from(possible_media_types))
-            body_ = ValueContainer(value=draw(strategy), generator=body_generator)
+            if media_type is not None and parse_content_type(media_type) == ("application", "x-www-form-urlencoded"):
+                strategy = strategy.map(prepare_urlencoded).filter(is_valid_urlencoded)
+            body_ = ValueContainer(value=draw(strategy), location="body", generator=body_generator)
         else:
-            body_ = ValueContainer(value=body, generator=None)
+            body_ = ValueContainer(value=body, location="body", generator=None)
     else:
-        media_types = operation.get_request_payload_content_types() or ["application/json"]
-        # Take the first available media type.
-        # POSSIBLE IMPROVEMENT:
-        #   - Test examples for each available media type on Open API 2.0;
-        #   - On Open API 3.0, media types are explicit, and each example has it.
-        #     We can pass `OpenAPIBody.media_type` here from the examples handling code.
-        media_type = media_types[0]
-        body_ = ValueContainer(value=body, generator=None)
+        # This explicit body payload comes for a media type that has a custom strategy registered
+        # Such strategies only support binary payloads, otherwise they can't be serialized
+        if not isinstance(body, bytes) and media_type in MEDIA_TYPES:
+            all_media_types = operation.get_request_payload_content_types()
+            raise SerializationNotPossible.from_media_types(*all_media_types)
+        body_ = ValueContainer(value=body, location="body", generator=None)
 
     if operation.schema.validate_schema and operation.method.upper() == "GET" and operation.body:
-        raise InvalidSchema("Body parameters are defined for GET request.")
+        raise BodyInGetRequestError("GET requests should not contain body parameters.")
     # If we need to generate negative cases but no generated values were negated, then skip the whole test
     if generator.is_negative and not any_negated_values([query_, cookies_, headers_, path_parameters_, body_]):
-        skip(operation.verbose_name)
+        if skip_on_not_negated:
+            skip(operation.verbose_name)
+        else:
+            reject()
     instance = Case(
         operation=operation,
+        generation_time=time.monotonic() - start,
         media_type=media_type,
         path_parameters=path_parameters_.value,
         headers=CaseInsensitiveDict(headers_.value) if headers_.value is not None else headers_.value,
@@ -199,6 +170,18 @@ def get_case_strategy(
         query=query_.value,
         body=body_.value,
         data_generation_method=generator,
+        meta=GenerationMetadata(
+            query=query_.generator,
+            path_parameters=path_parameters_.generator,
+            headers=headers_.generator,
+            cookies=cookies_.generator,
+            body=body_.generator,
+            phase=phase,
+            description=None,
+            location=None,
+            parameter=None,
+            parameter_location=None,
+        ),
     )
     auth_context = auths.AuthContext(
         operation=operation,
@@ -215,14 +198,17 @@ def _get_body_strategy(
     parameter: OpenAPIBody,
     strategy_factory: StrategyFactory,
     operation: APIOperation,
+    generation_config: GenerationConfig,
 ) -> st.SearchStrategy:
+    if parameter.media_type in MEDIA_TYPES:
+        return MEDIA_TYPES[parameter.media_type]
     # The cache key relies on object ids, which means that the parameter should not be mutated
     # Note, the parent schema is not included as each parameter belong only to one schema
     if parameter in _BODY_STRATEGIES_CACHE and strategy_factory in _BODY_STRATEGIES_CACHE[parameter]:
         return _BODY_STRATEGIES_CACHE[parameter][strategy_factory]
     schema = parameter.as_json_schema(operation)
     schema = operation.schema.prepare_schema(schema)
-    strategy = strategy_factory(schema, operation.verbose_name, "body", parameter.media_type)
+    strategy = strategy_factory(schema, operation.verbose_name, "body", parameter.media_type, generation_config)
     if not parameter.is_required:
         strategy |= st.just(NOT_SET)
     _BODY_STRATEGIES_CACHE.setdefault(parameter, {})[strategy_factory] = strategy
@@ -230,24 +216,25 @@ def _get_body_strategy(
 
 
 def get_parameters_value(
-    value: Union[NotSet, Dict[str, Any]],
+    value: NotSet | dict[str, Any],
     location: str,
     draw: Callable,
     operation: APIOperation,
     context: HookContext,
-    hooks: Optional[HookDispatcher],
+    hooks: HookDispatcher | None,
     strategy_factory: StrategyFactory,
-) -> Optional[Dict[str, Any]]:
+    generation_config: GenerationConfig,
+) -> dict[str, Any] | None:
     """Get the final value for the specified location.
 
     If the value is not set, then generate it from the relevant strategy. Otherwise, check what is missing in it and
     generate those parts.
     """
     if isinstance(value, NotSet) or not value:
-        strategy = get_parameters_strategy(operation, strategy_factory, location)
+        strategy = get_parameters_strategy(operation, strategy_factory, location, generation_config)
         strategy = apply_hooks(operation, context, hooks, strategy, location)
         return draw(strategy)
-    strategy = get_parameters_strategy(operation, strategy_factory, location, exclude=value.keys())
+    strategy = get_parameters_strategy(operation, strategy_factory, location, generation_config, exclude=value.keys())
     strategy = apply_hooks(operation, context, hooks, strategy, location)
     new = draw(strategy)
     if new is not None:
@@ -265,27 +252,31 @@ class ValueContainer:
     """Container for a value generated by a data generator or explicitly provided."""
 
     value: Any
-    generator: Optional[DataGenerationMethod]
+    location: str
+    generator: DataGenerationMethod | None
+
+    __slots__ = ("value", "location", "generator")
 
     @property
     def is_generated(self) -> bool:
         """If value was generated."""
-        return self.value is not None and self.generator is not None
+        return self.generator is not None and (self.location == "body" or self.value is not None)
 
 
-def any_negated_values(values: List[ValueContainer]) -> bool:
+def any_negated_values(values: list[ValueContainer]) -> bool:
     """Check if any generated values are negated."""
     return any(value.generator == DataGenerationMethod.negative for value in values if value.is_generated)
 
 
 def generate_parameter(
     location: str,
-    explicit: Union[NotSet, Dict[str, Any]],
+    explicit: NotSet | dict[str, Any],
     operation: APIOperation,
     draw: Callable,
     context: HookContext,
-    hooks: Optional[HookDispatcher],
+    hooks: HookDispatcher | None,
     generator: DataGenerationMethod,
+    generation_config: GenerationConfig,
 ) -> ValueContainer:
     """Generate a value for a parameter.
 
@@ -301,13 +292,15 @@ def generate_parameter(
         generator = DataGenerationMethod.positive
     else:
         strategy_factory = DATA_GENERATION_METHOD_TO_STRATEGY_FACTORY[generator]
-    value = get_parameters_value(explicit, location, draw, operation, context, hooks, strategy_factory)
-    used_generator: Optional[DataGenerationMethod] = generator
+    value = get_parameters_value(
+        explicit, location, draw, operation, context, hooks, strategy_factory, generation_config
+    )
+    used_generator: DataGenerationMethod | None = generator
     if value == explicit:
         # When we pass `explicit`, then its parts are excluded from generation of the final value
         # If the final value is the same, then other parameters were generated at all
         used_generator = None
-    return ValueContainer(value=value, generator=used_generator)
+    return ValueContainer(value=value, location=location, generator=used_generator)
 
 
 def can_negate_path_parameters(operation: APIOperation) -> bool:
@@ -331,10 +324,27 @@ def can_negate_headers(operation: APIOperation, location: str) -> bool:
     return any(header != {"type": "string"} for header in headers.values())
 
 
+def get_schema_for_location(
+    operation: APIOperation, location: str, parameters: Iterable[OpenAPIParameter]
+) -> dict[str, Any]:
+    schema = parameters_to_json_schema(operation, parameters)
+    if location == "path":
+        if not operation.schema.validate_schema:
+            # If schema validation is disabled, we try to generate data even if the parameter definition
+            # contains errors.
+            # In this case, we know that the `required` keyword should always be `True`.
+            schema["required"] = list(schema["properties"])
+        for prop in schema.get("properties", {}).values():
+            if prop.get("type") == "string":
+                prop.setdefault("minLength", 1)
+    return operation.schema.prepare_schema(schema)
+
+
 def get_parameters_strategy(
     operation: APIOperation,
     strategy_factory: StrategyFactory,
     location: str,
+    generation_config: GenerationConfig,
     exclude: Iterable[str] = (),
 ) -> st.SearchStrategy:
     """Create a new strategy for the case's component from the API operation parameters."""
@@ -344,13 +354,7 @@ def get_parameters_strategy(
         nested_cache_key = (strategy_factory, location, tuple(sorted(exclude)))
         if operation in _PARAMETER_STRATEGIES_CACHE and nested_cache_key in _PARAMETER_STRATEGIES_CACHE[operation]:
             return _PARAMETER_STRATEGIES_CACHE[operation][nested_cache_key]
-        schema = parameters_to_json_schema(operation, parameters)
-        if not operation.schema.validate_schema and location == "path":
-            # If schema validation is disabled, we try to generate data even if the parameter definition
-            # contains errors.
-            # In this case, we know that the `required` keyword should always be `True`.
-            schema["required"] = list(schema["properties"])
-        schema = operation.schema.prepare_schema(schema)
+        schema = get_schema_for_location(operation, location, parameters)
         for name in exclude:
             # Values from `exclude` are not necessarily valid for the schema - they come from user-defined examples
             # that may be invalid
@@ -361,7 +365,7 @@ def get_parameters_strategy(
             # Nothing to negate - all properties were excluded
             strategy = st.none()
         else:
-            strategy = strategy_factory(schema, operation.verbose_name, location, None)
+            strategy = strategy_factory(schema, operation.verbose_name, location, None, generation_config)
             serialize = operation.get_parameter_serializer(location)
             if serialize is not None:
                 strategy = strategy.map(serialize)
@@ -378,19 +382,17 @@ def get_parameters_strategy(
             # `True` / `False` / `None` improves chances of them passing validation in apps
             # that expect boolean / null types
             # and not aware of Python-specific representation of those types
-            map_func = {
-                "path": compose(quote_all, jsonify_python_specific_types),
-                "query": jsonify_python_specific_types,
-            }.get(location)
-            if map_func:
-                strategy = strategy.map(map_func)  # type: ignore
+            if location == "path":
+                strategy = strategy.map(quote_all).map(jsonify_python_specific_types)
+            elif location == "query":
+                strategy = strategy.map(jsonify_python_specific_types)
         _PARAMETER_STRATEGIES_CACHE.setdefault(operation, {})[nested_cache_key] = strategy
         return strategy
     # No parameters defined for this location
     return st.none()
 
 
-def jsonify_python_specific_types(value: Dict[str, Any]) -> Dict[str, Any]:
+def jsonify_python_specific_types(value: dict[str, Any]) -> dict[str, Any]:
     """Convert Python-specific values to their JSON equivalents."""
     stack: list = [value]
     while stack:
@@ -410,12 +412,24 @@ def jsonify_python_specific_types(value: Dict[str, Any]) -> Dict[str, Any]:
     return value
 
 
+def _build_custom_formats(
+    custom_formats: dict[str, st.SearchStrategy] | None, generation_config: GenerationConfig
+) -> dict[str, st.SearchStrategy]:
+    custom_formats = {**get_default_format_strategies(), **STRING_FORMATS, **(custom_formats or {})}
+    if generation_config.headers.strategy is not None:
+        custom_formats[HEADER_FORMAT] = generation_config.headers.strategy
+    elif not generation_config.allow_x00:
+        custom_formats[HEADER_FORMAT] = header_values(blacklist_characters="\n\r\x00")
+    return custom_formats
+
+
 def make_positive_strategy(
-    schema: Dict[str, Any],
+    schema: dict[str, Any],
     operation_name: str,
     location: str,
-    media_type: Optional[str],
-    custom_formats: Optional[Dict[str, st.SearchStrategy]] = None,
+    media_type: str | None,
+    generation_config: GenerationConfig,
+    custom_formats: dict[str, st.SearchStrategy] | None = None,
 ) -> st.SearchStrategy:
     """Strategy for generating values that fit the schema."""
     if is_header_location(location):
@@ -425,27 +439,36 @@ def make_positive_strategy(
         for sub_schema in schema.get("properties", {}).values():
             if list(sub_schema) == ["type"] and sub_schema["type"] == "string":
                 sub_schema.setdefault("format", HEADER_FORMAT)
-    return from_schema(schema, custom_formats={**STRING_FORMATS, **(custom_formats or {})})
+    custom_formats = _build_custom_formats(custom_formats, generation_config)
+    return from_schema(
+        schema,
+        custom_formats=custom_formats,
+        allow_x00=generation_config.allow_x00,
+        codec=generation_config.codec,
+    )
 
 
-def _can_skip_header_filter(schema: Dict[str, Any]) -> bool:
+def _can_skip_header_filter(schema: dict[str, Any]) -> bool:
     # All headers should contain HEADER_FORMAT in order to avoid header filter
     return all(sub_schema.get("format") == HEADER_FORMAT for sub_schema in schema.get("properties", {}).values())
 
 
 def make_negative_strategy(
-    schema: Dict[str, Any],
+    schema: dict[str, Any],
     operation_name: str,
     location: str,
-    media_type: Optional[str],
-    custom_formats: Optional[Dict[str, st.SearchStrategy]] = None,
+    media_type: str | None,
+    generation_config: GenerationConfig,
+    custom_formats: dict[str, st.SearchStrategy] | None = None,
 ) -> st.SearchStrategy:
+    custom_formats = _build_custom_formats(custom_formats, generation_config)
     return negative_schema(
         schema,
         operation_name=operation_name,
         location=location,
         media_type=media_type,
-        custom_formats={**STRING_FORMATS, **(custom_formats or {})},
+        custom_formats=custom_formats,
+        generation_config=generation_config,
     )
 
 
@@ -455,7 +478,7 @@ DATA_GENERATION_METHOD_TO_STRATEGY_FACTORY = {
 }
 
 
-def is_valid_path(parameters: Dict[str, Any]) -> bool:
+def is_valid_path(parameters: dict[str, Any]) -> bool:
     """Empty strings ("") are excluded from path by urllib3.
 
     A path containing to "/" or "%2F" will lead to ambiguous path resolution in
@@ -468,12 +491,17 @@ def is_valid_path(parameters: Dict[str, Any]) -> bool:
     disallowed_values = (SLASH, "")
 
     return not any(
-        (value in disallowed_values or is_illegal_surrogate(value) or isinstance(value, str) and SLASH in value)
+        (
+            value in disallowed_values
+            or is_illegal_surrogate(value)
+            or isinstance(value, str)
+            and (SLASH in value or "}" in value or "{" in value)
+        )
         for value in parameters.values()
     )
 
 
-def quote_all(parameters: Dict[str, Any]) -> Dict[str, Any]:
+def quote_all(parameters: dict[str, Any]) -> dict[str, Any]:
     """Apply URL quotation for all values in a dictionary."""
     # Even though, "." is an unreserved character, it has a special meaning in "." and ".." strings.
     # It will change the path:
@@ -495,26 +523,13 @@ def quote_all(parameters: Dict[str, Any]) -> Dict[str, Any]:
 def apply_hooks(
     operation: APIOperation,
     context: HookContext,
-    hooks: Optional[HookDispatcher],
+    hooks: HookDispatcher | None,
     strategy: st.SearchStrategy,
     location: str,
 ) -> st.SearchStrategy:
-    """Apply all `before_generate_` hooks related to the given location."""
-    strategy = _apply_hooks(context, GLOBAL_HOOK_DISPATCHER, strategy, location)
-    strategy = _apply_hooks(context, operation.schema.hooks, strategy, location)
-    if hooks is not None:
-        strategy = _apply_hooks(context, hooks, strategy, location)
-    return strategy
-
-
-def _apply_hooks(
-    context: HookContext, hooks: HookDispatcher, strategy: st.SearchStrategy, location: str
-) -> st.SearchStrategy:
-    """Apply all `before_generate_` hooks related to the given location & dispatcher."""
+    """Apply all hooks related to the given location."""
     container = LOCATION_TO_CONTAINER[location]
-    for hook in hooks.get_all_by_name(f"before_generate_{container}"):
-        strategy = hook(context, strategy)
-    return strategy
+    return apply_to_all_dispatchers(operation, context, hooks, strategy, container)
 
 
 def clear_cache() -> None:

@@ -1,5 +1,16 @@
+from __future__ import annotations
+
+import textwrap
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any
+
+from schemathesis.internal.output import OutputConfig
+
+if TYPE_CHECKING:
+    from json import JSONDecodeError
+
+    from graphql.error import GraphQLFormattedError
+    from jsonschema import ValidationError
 
 
 class FailureContext:
@@ -11,7 +22,7 @@ class FailureContext:
     message: str
     type: str
 
-    def unique_by_key(self, check_message: Optional[str]) -> Tuple[str, ...]:
+    def unique_by_key(self, check_message: str | None) -> tuple[str, ...]:
         """A key to distinguish different failure contexts."""
         return (check_message or self.message,)
 
@@ -21,17 +32,44 @@ class ValidationErrorContext(FailureContext):
     """Additional information about JSON Schema validation errors."""
 
     validation_message: str
-    schema_path: List[Union[str, int]]
-    schema: Union[Dict[str, Any], bool]
-    instance_path: List[Union[str, int]]
-    instance: Union[None, bool, float, str, list, Dict[str, Any]]
-    title: str = "Non-conforming response payload"
-    message: str = "Response does not conform to the defined schema"
+    schema_path: list[str | int]
+    schema: dict[str, Any] | bool
+    instance_path: list[str | int]
+    instance: None | bool | float | str | list | dict[str, Any]
+    message: str
+    title: str = "Response violates schema"
     type: str = "json_schema"
 
-    def unique_by_key(self, check_message: Optional[str]) -> Tuple[str, ...]:
+    def unique_by_key(self, check_message: str | None) -> tuple[str, ...]:
         # Deduplicate by JSON Schema path. All errors that happened on this sub-schema will be deduplicated
         return ("/".join(map(str, self.schema_path)),)
+
+    @classmethod
+    def from_exception(
+        cls, exc: ValidationError, *, output_config: OutputConfig | None = None
+    ) -> ValidationErrorContext:
+        from .internal.output import truncate_json
+
+        output_config = OutputConfig.from_parent(output_config, max_lines=20)
+        schema = textwrap.indent(truncate_json(exc.schema, config=output_config), prefix="    ")
+        value = textwrap.indent(truncate_json(exc.instance, config=output_config), prefix="    ")
+        schema_path = list(exc.absolute_schema_path)
+        if len(schema_path) > 1:
+            # Exclude the last segment, which is already in the schema
+            schema_title = "Schema at "
+            for segment in schema_path[:-1]:
+                schema_title += f"/{segment}"
+        else:
+            schema_title = "Schema"
+        message = f"{exc.message}\n\n{schema_title}:\n\n{schema}\n\nValue:\n\n{value}"
+        return cls(
+            message=message,
+            validation_message=exc.message,
+            schema_path=schema_path,
+            schema=exc.schema,
+            instance_path=list(exc.absolute_path),
+            instance=exc.instance,
+        )
 
 
 @dataclass(repr=False)
@@ -43,22 +81,34 @@ class JSONDecodeErrorContext(FailureContext):
     position: int
     lineno: int
     colno: int
+    message: str
     title: str = "JSON deserialization error"
-    message: str = "Response is not a valid JSON"
     type: str = "json_decode"
 
-    def unique_by_key(self, check_message: Optional[str]) -> Tuple[str, ...]:
+    def unique_by_key(self, check_message: str | None) -> tuple[str, ...]:
         # Treat different JSON decoding failures as the same issue
         # Payloads often contain dynamic data and distinguishing it by the error location still would not be sufficient
         # as it may be different on different dynamic payloads
         return (self.title,)
 
+    @classmethod
+    def from_exception(cls, exc: JSONDecodeError) -> JSONDecodeErrorContext:
+        message = f"Response must be valid JSON with 'Content-Type: application/json' header:\n\n  {exc}"
+        return cls(
+            message=message,
+            validation_message=exc.msg,
+            document=exc.doc,
+            position=exc.pos,
+            lineno=exc.lineno,
+            colno=exc.colno,
+        )
+
 
 @dataclass(repr=False)
 class ServerError(FailureContext):
     status_code: int
-    title: str = "Internal server error"
-    message: str = "Server got itself in trouble"
+    title: str = "Server error"
+    message: str = ""
     type: str = "server_error"
 
 
@@ -66,21 +116,80 @@ class ServerError(FailureContext):
 class MissingContentType(FailureContext):
     """Content type header is missing."""
 
-    media_types: List[str]
+    media_types: list[str]
+    message: str
     title: str = "Missing Content-Type header"
-    message: str = "Response is missing the `Content-Type` header"
     type: str = "missing_content_type"
 
 
 @dataclass(repr=False)
 class UndefinedContentType(FailureContext):
-    """Response has Content-Type that is not defined in the schema."""
+    """Response has Content-Type that is not documented in the schema."""
 
     content_type: str
-    defined_content_types: List[str]
-    title: str = "Undefined Content-Type"
-    message: str = "Response has `Content-Type` that is not declared in the schema"
+    defined_content_types: list[str]
+    message: str
+    title: str = "Undocumented Content-Type"
     type: str = "undefined_content_type"
+
+
+@dataclass(repr=False)
+class AcceptedNegativeData(FailureContext):
+    """Response with negative data was accepted."""
+
+    message: str
+    status_code: int
+    allowed_statuses: list[str]
+    title: str = "Accepted negative data"
+    type: str = "accepted_negative_data"
+
+    def unique_by_key(self, check_message: str | None) -> tuple[str, ...]:
+        return (
+            check_message or self.message,
+            str(self.status_code),
+        )
+
+
+@dataclass(repr=False)
+class RejectedPositiveData(FailureContext):
+    """Response with positive data was rejected."""
+
+    message: str
+    status_code: int
+    allowed_statuses: list[str]
+    title: str = "Rejected positive data"
+    type: str = "rejected_positive_data"
+
+
+@dataclass(repr=False)
+class UseAfterFree(FailureContext):
+    """Resource was used after a successful DELETE operation on it."""
+
+    message: str
+    free: str
+    usage: str
+    title: str = "Use after free"
+    type: str = "use_after_free"
+
+
+@dataclass(repr=False)
+class EnsureResourceAvailability(FailureContext):
+    """Resource is not available immediately after creation."""
+
+    message: str
+    created_with: str
+    not_available_with: str
+    title: str = "Resource is not available after creation"
+    type: str = "ensure_resource_availability"
+
+
+@dataclass(repr=False)
+class IgnoredAuth(FailureContext):
+    """The API operation does not check the specified authentication."""
+
+    message: str
+    title: str = "Authentication declared but not enforced for this operation"
+    type: str = "ignored_auth"
 
 
 @dataclass(repr=False)
@@ -90,11 +199,11 @@ class UndefinedStatusCode(FailureContext):
     # Response's status code
     status_code: int
     # Status codes as defined in schema
-    defined_status_codes: List[str]
+    defined_status_codes: list[str]
     # Defined status code with expanded wildcards
-    allowed_status_codes: List[int]
-    title: str = "Undefined status code"
-    message: str = "Response has a status code that is not declared in the schema"
+    allowed_status_codes: list[int]
+    message: str
+    title: str = "Undocumented HTTP status code"
     type: str = "undefined_status_code"
 
 
@@ -102,9 +211,9 @@ class UndefinedStatusCode(FailureContext):
 class MissingHeaders(FailureContext):
     """Some required headers are missing."""
 
-    missing_headers: List[str]
+    missing_headers: list[str]
+    message: str
     title: str = "Missing required headers"
-    message: str = "Response is missing headers required by the schema"
     type: str = "missing_headers"
 
 
@@ -117,8 +226,8 @@ class MalformedMediaType(FailureContext):
 
     actual: str
     defined: str
-    title: str = "Malformed media type name"
-    message: str = "Media type name is not valid"
+    message: str
+    title: str = "Malformed media type"
     type: str = "malformed_media_type"
 
 
@@ -128,9 +237,12 @@ class ResponseTimeExceeded(FailureContext):
 
     elapsed: float
     deadline: int
-    title: str = "Response time exceeded"
-    message: str = "Response time exceeds the deadline"
+    message: str
+    title: str = "Response time limit exceeded"
     type: str = "response_time_exceeded"
+
+    def unique_by_key(self, check_message: str | None) -> tuple[str, ...]:
+        return (self.title,)
 
 
 @dataclass(repr=False)
@@ -138,6 +250,35 @@ class RequestTimeout(FailureContext):
     """Request took longer than timeout."""
 
     timeout: int
-    title: str = "Request timeout"
-    message: str = "The request timed out"
+    message: str
+    title: str = "Response timeout"
     type: str = "request_timeout"
+
+
+@dataclass(repr=False)
+class UnexpectedGraphQLResponse(FailureContext):
+    """GraphQL response is not a JSON object."""
+
+    message: str
+    title: str = "Unexpected GraphQL Response"
+    type: str = "graphql_unexpected_response"
+
+
+@dataclass(repr=False)
+class GraphQLClientError(FailureContext):
+    """GraphQL query has not been executed."""
+
+    message: str
+    errors: list[GraphQLFormattedError]
+    title: str = "GraphQL client error"
+    type: str = "graphql_client_error"
+
+
+@dataclass(repr=False)
+class GraphQLServerError(FailureContext):
+    """GraphQL response indicates at least one server error."""
+
+    message: str
+    errors: list[GraphQLFormattedError]
+    title: str = "GraphQL server error"
+    type: str = "graphql_server_error"

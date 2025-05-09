@@ -45,43 +45,129 @@ Running these tests requires your app running at ``http://0.0.0.0:8080/`` and a 
 
 By default, Schemathesis refuses to work with schemas that do not conform to the Open API spec, but you can disable this behavior by passing the ``validate_schema=False`` argument to the ``from_uri`` function.
 
-Testing specific operations
+Narrowing the testing scope
 ---------------------------
 
-By default, Schemathesis runs tests for all operations, but you can select specific operations by passing the following arguments to the ``parametrize`` function:
+By default, Schemathesis tests all operations in your API. However, you can fine-tune your test scope to include or exclude specific operations based on paths, methods, names, tags, and operation IDs.
 
-- ``endpoint``. Operation path;
-- ``method``. HTTP method;
-- ``tag``. Open API tag;
-- ``operation_id``. ``operationId`` field value;
+Include and Exclude Options
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Each argument expects a case-insensitive regex string or a list of such strings.
-Each regex will be matched with its corresponding value via Python's ``re.search`` function.
+Use ``include`` and ``exclude`` methods on the schema to select specific operations in your tests:
 
-.. important::
+.. code:: python
 
-    As filters are treated as regular expressions, ensure that they contain proper anchors.
-    For example, `/users/` will match `/v1/users/orders/`, but `^/users/$` will match only `/users/`.
+    @schema.include(tag="admin").exclude(method="POST").parametrize()
+    def test_api(case):
+        ...
 
-For example, the following test selects all operations which paths start with ``/api/users``:
+Each method accepts the following arguments:
+
+- ``path``. Path of the operation.
+- ``method``. HTTP method.
+- ``name``. Full operation name.
+- ``tag``. Open API tag.
+- ``operation_id``. ``operationId`` field value.
+
+Each argument is either a single string or a list of strings. Note that all conditions within the same method call are combined with the logical AND operator.
+Additionally, if you pass a list of strings, it means that the operation should match at least one of the provided values.
+
+Every argument is accompanied with its version with the ``_regex`` suffix that enables regular expression matching for the specified criteria. 
+For example, ``include(path_regex="^/users")`` matches any path starting with ``/users``. 
+Without this suffix (e.g., ``include(path="/users")``), the option performs an exact match. 
+Use regex for flexible pattern matching and the non-regex version for precise, literal matching.
+
+Additionally, you can exclude deprecated operations with:
+
+- ``exclude(deprecated=True)``
+
+.. note::
+
+   The ``name`` property in Schemathesis refers to the full operation name. 
+   For Open API, it is formatted as ``HTTP_METHOD PATH`` (e.g., ``GET /users``). 
+   For GraphQL, it follows the pattern ``OperationType.field`` (e.g., ``Query.getBookings`` or ``Mutation.updateOrder``).
+
+You also can filter API operations by a custom function:
+
+.. code:: python
+
+  def my_custom_filter(ctx):
+      return ctx.operation.definition.resolved.get("x-property") == 42
+
+  @schema.include(my_custom_filter).parametrize()
+  def test_api(case):
+      ...
+
+Examples
+~~~~~~~~
+
+Include operations with paths starting with ``/api/users``:
+
+.. code:: python
+
+  @schema.include(path_regex="^/api/users").parametrize()
+  def test_api(case):
+      ...
+
+Exclude POST method operations:
+
+.. code:: python
+
+  @schema.exclude(method="POST").parametrize()
+  def test_api(case):
+      ...
+
+Include operations with the ``admin`` tag:
+
+.. code:: python
+
+  @schema.include(tag="admin").parametrize()
+  def test_api(case):
+      ...
+
+Exclude deprecated operations:
+
+.. code:: python
+
+  @schema.exclude(deprecated=True).parametrize()
+  def test_api(case):
+      ...
+
+Include ``GET /users`` and ``POST /orders``:
+
+.. code:: python
+
+  @schema.include(name=["GET /users", "POST /orders"]).parametrize()
+  def test_api(case):
+      ...
+
+Overriding test data
+--------------------
+
+You can set specific values for Open API parameters in test cases, such as query parameters, headers and cookies.
+
+This is particularly useful for scenarios where specific parameter values are required for deeper testing.
+For instance, when dealing with values that represent data in a database, which Schemathesis might not automatically know or generate.
+
+To override parameters, use the ``schema.override`` decorator that accepts ``query``, ``headers``, ``cookies``, or ``path_parameters`` arguments as dictionaries.
+You can specify multiple overrides in a single command and each of them will be applied only to API operations that use such a parameter.
+
+For example, to override a query parameter and path:
 
 .. code:: python
 
     schema = ...  # Load the API schema here
 
 
-    @schema.parametrize(endpoint="^/api/users")
+    @schema.parametrize()
+    @schema.override(path_parameters={"user_id": "42"}, query={"apiKey": "secret"})
     def test_api(case):
-        case.call_and_validate()
 
-If your API contains deprecated operations (that have ``deprecated: true`` in their definition),
-then you can skip them by passing ``skip_deprecated_operations=True`` to loaders or to the `schema.parametrize` call:
+This decorator overrides the ``apiKey`` query parameter and ``user_id`` path parameter, using ``secret`` and ``42`` as their respective values in all applicable test cases.
 
-.. code:: python
+.. note::
 
-    schema = schemathesis.from_uri(
-        "https://example.schemathesis.io/openapi.json", skip_deprecated_operations=True
-    )
+    Of course, you can override them inside the test function body, but it requires checking whether the ones you want to override valid for the tested endpoint, and it has a performance penalty.
 
 Tests configuration
 -------------------
@@ -198,7 +284,7 @@ If you maintain your API schema in Python code or your web framework (for exampl
 Web applications
 ~~~~~~~~~~~~~~~~
 
-Schemathesis natively supports testing of ASGI and WSGI compatible apps (e.g., Flask or FastAPI),
+Schemathesis natively supports testing of ASGI and WSGI compatible apps (e.g., FastAPI or Flask),
 which is significantly faster since it doesn't involve the network.
 
 .. code:: python
@@ -226,6 +312,7 @@ This approach requires an initialized application instance to generate the API s
 
 .. code:: python
 
+    from contextlib import asynccontextmanager
     from fastapi import FastAPI
     import pytest
     import schemathesis
@@ -233,19 +320,17 @@ This approach requires an initialized application instance to generate the API s
 
     @pytest.fixture
     def web_app(db):
-        # some dynamically built application
-        # that depends on other fixtures
-        app = FastAPI()
-
-        @app.on_event("startup")
-        async def startup():
+        @asynccontextmanager
+        async def lifespan(_: FastAPI):
             await db.connect()
-
-        @app.on_event("shutdown")
-        async def shutdown():
+            yield
             await db.disconnect()
 
-        return schemathesis.from_dict(app.openapi())
+        # some dynamically built application
+        # that depends on other fixtures
+        app = FastAPI(lifespan=lifespan)
+
+        return schemathesis.from_dict(app.openapi(), app)
 
 
     schema = schemathesis.from_pytest_fixture("web_app")
@@ -271,9 +356,13 @@ When the received response is validated, Schemathesis runs the following checks:
 - ``status_code_conformance``. The response status is not defined in the API schema;
 - ``content_type_conformance``. The response content type is not defined in the API schema;
 - ``response_schema_conformance``. The response content does not conform to the schema defined for this specific response;
-- ``response_headers_conformance``. The response headers does not contain all defined headers.
+- ``negative_data_rejection``. The API accepts data that is invalid according to the schema;
+- ``response_headers_conformance``. The response headers do not contain all defined headers or do not conform to their respective schemas.
+- ``use_after_free``. The API returned a non-404 response a successful DELETE operation on a resource. **NOTE**: At the moment it is only available in state-machine-based stateful testing.
+- ``ensure_resource_availability``. Freshly created resource is not available in related API operations. **NOTE**: Only enabled for new-style stateful testing.
+- ``ignored_auth``. The API operation does not check the specified authentication.
 
-Validation happens in the ``case.validate_response`` function, but you can add your code to verify the response conformance as you do in regular Python tests.
+Validation happens in the ``case.call_and_validate`` function, but you can add your code to verify the response conformance as you do in regular Python tests.
 By default, all available checks will be applied, but you can customize it by passing a tuple of checks explicitly:
 
 .. code-block:: python
@@ -285,8 +374,7 @@ By default, all available checks will be applied, but you can customize it by pa
 
     @schema.parametrize()
     def test_api(case):
-        response = case.call()
-        case.validate_response(response, checks=(not_a_server_error,))
+        case.call_and_validate(checks=(not_a_server_error,))
 
 The code above will run only the ``not_a_server_error`` check. Or a tuple of additional checks will be executed after ones from the ``checks`` argument:
 
@@ -301,8 +389,7 @@ The code above will run only the ``not_a_server_error`` check. Or a tuple of add
 
     @schema.parametrize()
     def test_api(case):
-        response = case.call()
-        case.validate_response(response, additional_checks=(my_check,))
+        case.call_and_validate(additional_checks=(my_check,))
 
 .. note::
 
@@ -319,8 +406,7 @@ You can also use the ``excluded_checks`` argument to exclude chhecks from runnin
 
     @schema.parametrize()
     def test_api(case):
-        response = case.call()
-        case.validate_response(response, excluded_checks=(not_a_server_error,))
+        case.call_and_validate(excluded_checks=(not_a_server_error,))
 
 The code above will run the default checks, and any additional checks, excluding the ``not_a_server_error`` check.
 
@@ -364,15 +450,14 @@ In the following example we test a hypothetical ``/api/auth/password/reset/`` op
     schema = ...  # Load the API schema here
 
 
-    @schema.parametrize(endpoint="/api/auth/password/reset/")
+    @schema.include(path="/api/auth/password/reset/").parametrize()
     @schema.given(data=st.data())
     def test_password_reset(data, case, user):
         if data.draw(st.booleans()):
             case.body["token"] = data.draw(
                 (st.emails() | st.just(user.email)).map(create_reset_password_token)
             )
-        response = case.call_asgi(app=app)
-        case.validate_response(response)
+        case.call_and_validate()
 
 Here we use the special `data strategy <https://hypothesis.readthedocs.io/en/latest/data.html#drawing-interactively-in-tests>`_ to change the ``case`` data in ~50% cases.
 The additional strategy in the conditional branch creates a valid password reset token from the given email.
@@ -385,11 +470,50 @@ This trick allows the test to cover three different situations where the input t
 
 Using custom Hypothesis strategies allows you to expand the testing surface significantly.
 
-ASGI / WSGI support
+Note that tests that use custom Hypothesis examples won't work if your schema contains explicit examples. 
+They are incompatible because Schemathesis only builds the ``case`` argument from the examples and does not know
+what values to provide for other arguments you define for your test function.
+
+Be aware of a key limitation when integrating Schemathesis with Hypothesis and pytest for testing.
+Schemathesis is unable to simultaneously support custom Hypothesis strategies and explicit examples defined in your API schema. 
+This limitation arises because Schemathesis generates ``hypothesis.example`` instances from schema-defined examples, but it 
+doesn't have the capability to infer or assign appropriate values for additional custom arguments in your test functions.
+To effectively manage this, you should consider structuring your tests differently. 
+For tests involving custom Hypothesis strategies, you need to exclude ``Phase.explicit`` to avoid conflicts. 
+
+.. code-block:: python
+
+    from hypothesis import strategies as st, settings, Phase
+
+    ...
+
+    @schema.parametrize()
+    @schema.given(data=st.data())
+    @settings(phases=set(Phase) - {Phase.explicit})
+    def test_api(data, case, user):
+        ...
+
+In contrast, if you intend to test schema-provided explicit examples, create a separate test function without the ``schema.given`` decorator. 
+This approach ensures that both types of tests can be executed, albeit in separate contexts.
+
+.. code-block:: python
+
+    from hypothesis import settings, Phase
+
+    ...
+
+    @schema.parametrize()
+    @settings(phases=[Phase.explicit])
+    def test_explicit_examples(data, case, user):
+        ...
+
+ASGI & WSGI support
 -------------------
 
-Schemathesis supports making calls to ASGI and WSGI-compliant applications instead of real network calls;
-in this case, the test execution will go much faster.
+Schemathesis supports making calls to `ASGI <https://asgi.readthedocs.io/en/latest/>`_ and `WSGI-compliant <https://docs.python.org/3/library/wsgiref.html>`_ applications instead of through real network calls,
+significantly speeding up test execution.
+
+Using Schemathesis with a Flask application (WSGI):
 
 .. code:: python
 
@@ -406,40 +530,121 @@ in this case, the test execution will go much faster.
 
     @app.route("/v1/users", methods=["GET"])
     def users():
-        return jsonify([{"name": "Robin"}])
+        return [{"name": "Robin"}]
 
 
+    # Load the schema from the WSGI app
     schema = schemathesis.from_wsgi("/schema.json", app)
 
 
     @schema.parametrize()
     def test_api(case):
-        response = case.call_wsgi()
-        case.validate_response(response)
+        # The test case will make a call to the application and validate the response
+        # against the defined schema automatically.
+        case.call_and_validate()
 
-If you don't supply the ``app`` argument to the loader, make sure you pass your test client when running tests:
+Running the example above with ``pytest`` will execute property-based tests against the Flask application.
 
-.. code-block:: python
+Using Schemathesis with a FastAPI application (ASGI):
 
-    @pytest.fixture()
-    def app_schema(client):
-        openapi = client.app.openapi()
-        return schemathesis.from_dict(openapi)
+.. code:: python
+
+    from fastapi import FastAPI
+    import schemathesis
+
+    # Enable the experimental Open API 3.1 support
+    schemathesis.experimental.OPEN_API_3_1.enable()
+
+    app = FastAPI()
 
 
-    schema = schemathesis.from_pytest_fixture("app_schema")
+    @app.get("/v1/users")
+    async def users():
+        return [{"name": "Robin"}]
+
+
+    # Load the schema from the ASGI app
+    schema = schemathesis.from_asgi("/openapi.json", app)
 
 
     @schema.parametrize()
-    def test_api(case, client):
-        # The `session` argument must be supplied.
-        case.call_and_validate(session=client)
+    def test_api(case):
+        # The test case will make a call to the application and validate the response
+        # against the defined schema automatically.
+        case.call_and_validate()
+
+Note that Schemathesis currently tests ASGI applications synchronously.
+
+Async support
+-------------
+
+Schemathesis supports asynchronous test functions executed via ``asyncio`` or ``trio``.
+They work the same way as regular async tests and don't require any additional configuration beyond
+installing ``pytest-asyncio`` or ``pytest-trio`` and following their usage guidelines.
+
+.. code:: python
+
+    import pytest
+    import schemathesis
+
+    schema = ...
+
+    @pytest.mark.trio
+    @schema.parametrize()
+    async def test_api(case):
+        ...
 
 Unittest support
 ----------------
 
 Schemathesis supports Python's built-in ``unittest`` framework out of the box.
 You only need to specify strategies for ``hypothesis.given``:
+
+A strategy can generate data for one or more API operations.
+To refer to an operation you can use a path and method combination for Open API:
+
+.. code-block:: python
+
+    operation = schema["/pet"]["POST"]
+
+Or ``Query`` / ``Mutation`` type name and a field name for GraphQL
+
+.. code-block:: python
+
+    operation = schema["Query"]["getBooks"]
+
+.. note::
+
+    If you use custom name for these types, use them instead.
+
+Then create a strategy from an operation by using the ``as_strategy`` method and optionally combine multiple of them into a single strategy.
+You can also create a strategy for all operations or a wider subset of them:
+
+.. code-block:: python
+
+    create_pet = schema["/pet/"]["POST"]
+    get_pet = schema["/pet/{pet_id}/"]["GET"]
+    get_books = graphql_schema["Query"]["getBooks"]
+
+    # The following strategies generate test cases for different sub-sets of API operations
+    # For `POST /pet/`
+    create_pet_strategy = create_pet.as_strategy()
+    # For `POST /pet` AND `GET /pet/{pet_id}/`
+    get_or_create_pet_strategy = get_pet.as_strategy() | create_pet.as_strategy()
+    # For the `getBooks` query
+    get_books_strategy = get_books.as_strategy()
+    # For all methods in the `/pet/` path
+    all_pet_strategy = schema["/pet/"].as_strategy()
+    # For all operations
+    all_operations_strategy = schema.as_strategy()
+    # For all queries
+    queries_strategy = graphql_schema["Query"].as_strategy()
+    # For all mutations & queries
+    mutations_and_queries_strategy = graphql_schema.as_strategy()
+
+The ``as_strategy`` method also accepts the ``data_generation_method`` argument allowing you to control whether it should generate positive or negative test cases.
+
+**NOTE**: The ``data_generation_method`` argument only affects Open API schemas at this moment.
 
 .. code-block:: python
 
@@ -448,13 +653,15 @@ You only need to specify strategies for ``hypothesis.given``:
     import schemathesis
 
     schema = schemathesis.from_uri("http://0.0.0.0:8080/schema.json")
-    new_pet_strategy = schema["/v2/pet"]["POST"].as_strategy()
-
+    create_pet = schema["/pet/"]["POST"]
+    create_pet_strategy = create_pet.as_strategy()
 
     class TestAPI(TestCase):
-        @given(case=new_pet_strategy)
+        @given(case=create_pet_strategy)
         def test_pets(self, case):
             case.call_and_validate()
+
+The test above will generate test cases for the ``POST /pet/`` operation and will execute the ``test_pets`` function body with every generated test sample.
 
 Rate limiting
 -------------

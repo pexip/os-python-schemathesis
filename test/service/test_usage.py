@@ -9,8 +9,8 @@ SCHEMA = "http://127.0.0.1:/schema.json"
 
 
 @pytest.mark.parametrize(
-    "args, expected",
-    (
+    ("args", "expected"),
+    [
         ([SCHEMA], {"schema_kind": "URL", "parameters": {}, "used_headers": []}),
         (
             [SCHEMA, "-H", "Authorization:key", "-H", "X-Key:value"],
@@ -52,7 +52,7 @@ SCHEMA = "http://127.0.0.1:/schema.json"
             [SCHEMA, "-E", "a", "-E", "b"],
             {"schema_kind": "URL", "parameters": {"endpoints": {"count": 2}}, "used_headers": []},
         ),
-    ),
+    ],
 )
 def test_collect(args, expected):
     cli_runner = CliRunner()
@@ -62,7 +62,8 @@ def test_collect(args, expected):
         collected = usage.collect(args)
         # Hooks are global, and could be modified by other tests.
         # Drop them, as it is simpler than introducing locking
-        del collected["hooks"]
+        if collected is not None:
+            del collected["hooks"]
         assert collected == expected
 
     result = cli_runner.invoke(run)

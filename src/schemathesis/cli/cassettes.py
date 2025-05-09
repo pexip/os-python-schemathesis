@@ -1,28 +1,51 @@
+from __future__ import annotations
+
 import base64
+import enum
 import json
 import re
 import sys
 import threading
 from dataclasses import dataclass, field
+from http.cookies import SimpleCookie
 from queue import Queue
-from typing import IO, Any, Dict, Generator, Iterator, List, Optional, cast
+from typing import IO, TYPE_CHECKING, Any, Callable, Generator, Iterator, cast
+from urllib.parse import parse_qsl, urlparse
 
-import click
-import requests
-from requests.cookies import RequestsCookieJar
-from requests.structures import CaseInsensitiveDict
-from yaml.emitter import Emitter
+import harfile
 
-from .. import constants
-from ..models import Request, Response
+from ..constants import SCHEMATHESIS_VERSION
 from ..runner import events
-from ..runner.serialization import SerializedCheck, SerializedInteraction
-from ..types import RequestCert
-from .context import ExecutionContext
 from .handlers import EventHandler
+
+if TYPE_CHECKING:
+    import click
+    import requests
+
+    from ..models import Request, Response
+    from ..runner.serialization import SerializedCheck, SerializedInteraction
+    from ..types import RequestCert
+    from .context import ExecutionContext
 
 # Wait until the worker terminates
 WRITER_WORKER_JOIN_TIMEOUT = 1
+
+
+class CassetteFormat(str, enum.Enum):
+    """Type of the cassette."""
+
+    VCR = "vcr"
+    HAR = "har"
+
+    @classmethod
+    def from_str(cls, value: str) -> CassetteFormat:
+        try:
+            return cls[value.upper()]
+        except KeyError:
+            available_formats = ", ".join(cls)
+            raise ValueError(
+                f"Invalid value for cassette format: {value}. Available formats: {available_formats}"
+            ) from None
 
 
 @dataclass
@@ -34,42 +57,47 @@ class CassetteWriter(EventHandler):
     """
 
     file_handle: click.utils.LazyFile
+    format: CassetteFormat
     preserve_exact_body_bytes: bool
     queue: Queue = field(default_factory=Queue)
     worker: threading.Thread = field(init=False)
 
     def __post_init__(self) -> None:
-        self.worker = threading.Thread(
-            target=worker,
-            kwargs={
-                "file_handle": self.file_handle,
-                "preserve_exact_body_bytes": self.preserve_exact_body_bytes,
-                "queue": self.queue,
-            },
-        )
+        kwargs = {
+            "file_handle": self.file_handle,
+            "queue": self.queue,
+            "preserve_exact_body_bytes": self.preserve_exact_body_bytes,
+        }
+        writer: Callable
+        if self.format == CassetteFormat.HAR:
+            writer = har_writer
+        else:
+            writer = vcr_writer
+        self.worker = threading.Thread(name="SchemathesisCassetteWriter", target=writer, kwargs=kwargs)
         self.worker.start()
 
     def handle_event(self, context: ExecutionContext, event: events.ExecutionEvent) -> None:
         if isinstance(event, events.Initialized):
             # In the beginning we write metadata and start `http_interactions` list
-            self.queue.put(Initialize())
-        if isinstance(event, events.AfterExecution):
-            # Seed is always present at this point, the original Optional[int] type is there because `TestResult`
-            # instance is created before `seed` is generated on the hypothesis side
-            seed = cast(int, event.result.seed)
+            self.queue.put(Initialize(seed=event.seed))
+        elif isinstance(event, events.AfterExecution):
             self.queue.put(
                 Process(
-                    seed=seed,
                     correlation_id=event.correlation_id,
                     thread_id=event.thread_id,
-                    # NOTE: For backward compatibility reasons AfterExecution stores a list of data generation methods
-                    # The list always contains one element - the method that was actually used for generation
-                    # This will change in the future
-                    data_generation_method=event.data_generation_method[0],
                     interactions=event.result.interactions,
                 )
             )
-        if isinstance(event, events.Finished):
+        elif isinstance(event, events.AfterStatefulExecution):
+            self.queue.put(
+                Process(
+                    # Correlation ID is not used in stateful testing
+                    correlation_id="",
+                    thread_id=event.thread_id,
+                    interactions=event.result.interactions,
+                )
+            )
+        elif isinstance(event, events.Finished):
             self.shutdown()
 
     def shutdown(self) -> None:
@@ -84,16 +112,16 @@ class CassetteWriter(EventHandler):
 class Initialize:
     """Start up, the first message to make preparations before proceeding the input data."""
 
+    seed: int | None
+
 
 @dataclass
 class Process:
     """A new chunk of data should be processed."""
 
-    seed: int
     correlation_id: str
     thread_id: int
-    data_generation_method: constants.DataGenerationMethod
-    interactions: List[SerializedInteraction]
+    interactions: list[SerializedInteraction]
 
 
 @dataclass
@@ -110,7 +138,7 @@ def get_command_representation() -> str:
     return f"st {args}"
 
 
-def worker(file_handle: click.utils.LazyFile, preserve_exact_body_bytes: bool, queue: Queue) -> None:
+def vcr_writer(file_handle: click.utils.LazyFile, preserve_exact_body_bytes: bool, queue: Queue) -> None:
     """Write YAML to a file in an incremental manner.
 
     This implementation doesn't use `pyyaml` package and composes YAML manually as string due to the following reasons:
@@ -123,20 +151,25 @@ def worker(file_handle: click.utils.LazyFile, preserve_exact_body_bytes: bool, q
     current_id = 1
     stream = file_handle.open()
 
-    def format_header_values(values: List[str]) -> str:
+    def format_header_values(values: list[str]) -> str:
         return "\n".join(f"      - {json.dumps(v)}" for v in values)
 
-    def format_headers(headers: Dict[str, List[str]]) -> str:
+    def format_headers(headers: dict[str, list[str]]) -> str:
         return "\n".join(f'      "{name}":\n{format_header_values(values)}' for name, values in headers.items())
 
-    def format_check_message(message: Optional[str]) -> str:
-        return "~" if message is None else f"{repr(message)}"
+    def format_check_message(message: str | None) -> str:
+        return "~" if message is None else f"{message!r}"
 
-    def format_checks(checks: List[SerializedCheck]) -> str:
-        return "\n".join(
+    def format_checks(checks: list[SerializedCheck]) -> str:
+        if not checks:
+            return "  checks: []"
+        items = "\n".join(
             f"    - name: '{check.name}'\n      status: '{check.value.name.upper()}'\n      message: {format_check_message(check.message)}"
             for check in checks
         )
+        return f"""
+  checks:
+{items}"""
 
     if preserve_exact_body_bytes:
 
@@ -181,28 +214,59 @@ def worker(file_handle: click.utils.LazyFile, preserve_exact_body_bytes: bool, q
                 )
                 write_double_quoted(output, string)
 
+    seed = "null"
     while True:
         item = queue.get()
         if isinstance(item, Initialize):
+            seed = f"'{item.seed}'"
             stream.write(
                 f"""command: '{get_command_representation()}'
-recorded_with: 'Schemathesis {constants.__version__}'
+recorded_with: 'Schemathesis {SCHEMATHESIS_VERSION}'
 http_interactions:"""
             )
         elif isinstance(item, Process):
             for interaction in item.interactions:
                 status = interaction.status.name.upper()
                 # Body payloads are handled via separate `stream.write` calls to avoid some allocations
+                phase = f"'{interaction.phase.value}'" if interaction.phase is not None else "null"
                 stream.write(
                     f"""\n- id: '{current_id}'
   status: '{status}'
-  seed: '{item.seed}'
+  seed: {seed}
   thread_id: {item.thread_id}
   correlation_id: '{item.correlation_id}'
-  data_generation_method: '{item.data_generation_method.value}'
-  elapsed: '{interaction.response.elapsed}'
+  data_generation_method: '{interaction.data_generation_method.value}'
+  meta:
+    description: """
+                )
+
+                if interaction.description is not None:
+                    write_double_quoted(stream, interaction.description)
+                else:
+                    stream.write("null")
+
+                stream.write("\n    location: ")
+                if interaction.location is not None:
+                    write_double_quoted(stream, interaction.location)
+                else:
+                    stream.write("null")
+
+                stream.write("\n    parameter: ")
+                if interaction.parameter is not None:
+                    write_double_quoted(stream, interaction.parameter)
+                else:
+                    stream.write("null")
+
+                stream.write("\n    parameter_location: ")
+                if interaction.parameter_location is not None:
+                    write_double_quoted(stream, interaction.parameter_location)
+                else:
+                    stream.write("null")
+                stream.write(
+                    f"""
+  phase: {phase}
+  elapsed: '{interaction.response.elapsed if interaction.response else 0}'
   recorded_at: '{interaction.recorded_at}'
-  checks:
 {format_checks(interaction.checks)}
   request:
     uri: '{interaction.request.uri}'
@@ -211,8 +275,9 @@ http_interactions:"""
 {format_headers(interaction.request.headers)}"""
                 )
                 format_request_body(stream, interaction.request)
-                stream.write(
-                    f"""
+                if interaction.response is not None:
+                    stream.write(
+                        f"""
   response:
     status:
       code: '{interaction.response.status_code}'
@@ -220,12 +285,16 @@ http_interactions:"""
     headers:
 {format_headers(interaction.response.headers)}
 """
-                )
-                format_response_body(stream, interaction.response)
-                stream.write(
-                    f"""
+                    )
+                    format_response_body(stream, interaction.response)
+                    stream.write(
+                        f"""
     http_version: '{interaction.response.http_version}'"""
-                )
+                    )
+                else:
+                    stream.write("""
+  response: null
+""")
                 current_id += 1
         else:
             break
@@ -239,6 +308,8 @@ def _safe_decode(value: str, encoding: str) -> str:
 
 def write_double_quoted(stream: IO, text: str) -> None:
     """Writes a valid YAML string enclosed in double quotes."""
+    from yaml.emitter import Emitter
+
     # Adapted from `yaml.Emitter.write_double_quoted`:
     #   - Doesn't split the string, therefore doesn't track the current column
     #   - Doesn't encode the input
@@ -252,8 +323,8 @@ def write_double_quoted(stream: IO, text: str) -> None:
             ch = text[end]
         if (
             ch is None
-            or ch in '"\\\x85\u2028\u2029\uFEFF'
-            or not ("\x20" <= ch <= "\x7E" or ("\xA0" <= ch <= "\uD7FF" or "\uE000" <= ch <= "\uFFFD"))
+            or ch in '"\\\x85\u2028\u2029\ufeff'
+            or not ("\x20" <= ch <= "\x7e" or ("\xa0" <= ch <= "\ud7ff" or "\ue000" <= ch <= "\ufffd"))
         ):
             if start < end:
                 stream.write(text[start:end])
@@ -262,64 +333,187 @@ def write_double_quoted(stream: IO, text: str) -> None:
                 # Escape character
                 if ch in Emitter.ESCAPE_REPLACEMENTS:
                     data = "\\" + Emitter.ESCAPE_REPLACEMENTS[ch]
-                elif ch <= "\xFF":
-                    data = "\\x%02X" % ord(ch)
-                elif ch <= "\uFFFF":
-                    data = "\\u%04X" % ord(ch)
+                elif ch <= "\xff":
+                    data = f"\\x{ord(ch):02X}"
+                elif ch <= "\uffff":
+                    data = f"\\u{ord(ch):04X}"
                 else:
-                    data = "\\U%08X" % ord(ch)
+                    data = f"\\U{ord(ch):08X}"
                 stream.write(data)
                 start = end + 1
         end += 1
     stream.write('"')
 
 
+def har_writer(file_handle: click.utils.LazyFile, preserve_exact_body_bytes: bool, queue: Queue) -> None:
+    if preserve_exact_body_bytes:
+
+        def get_body(body: str) -> str:
+            return body
+    else:
+
+        def get_body(body: str) -> str:
+            return base64.b64decode(body).decode("utf-8", errors="replace")
+
+    with harfile.open(file_handle) as har:
+        while True:
+            item = queue.get()
+            if isinstance(item, Process):
+                for interaction in item.interactions:
+                    query_params = urlparse(interaction.request.uri).query
+                    if interaction.request.body is not None:
+                        post_data = harfile.PostData(
+                            mimeType=interaction.request.headers.get("Content-Type", [""])[0],
+                            text=get_body(interaction.request.body),
+                        )
+                    else:
+                        post_data = None
+                    if interaction.response is not None:
+                        content_type = interaction.response.headers.get("Content-Type", [""])[0]
+                        content = harfile.Content(
+                            size=interaction.response.body_size or 0,
+                            mimeType=content_type,
+                            text=get_body(interaction.response.body) if interaction.response.body is not None else None,
+                            encoding="base64"
+                            if interaction.response.body is not None and preserve_exact_body_bytes
+                            else None,
+                        )
+                        http_version = f"HTTP/{interaction.response.http_version}"
+                        response = harfile.Response(
+                            status=interaction.response.status_code,
+                            httpVersion=http_version,
+                            statusText=interaction.response.message,
+                            headers=[
+                                harfile.Record(name=name, value=values[0])
+                                for name, values in interaction.response.headers.items()
+                            ],
+                            cookies=_extract_cookies(interaction.response.headers.get("Set-Cookie", [])),
+                            content=content,
+                            headersSize=_headers_size(interaction.response.headers),
+                            bodySize=interaction.response.body_size or 0,
+                            redirectURL=interaction.response.headers.get("Location", [""])[0],
+                        )
+                        time = round(interaction.response.elapsed * 1000, 2)
+                    else:
+                        response = HARFILE_NO_RESPONSE
+                        time = 0
+                        http_version = ""
+
+                    har.add_entry(
+                        startedDateTime=interaction.recorded_at,
+                        time=time,
+                        request=harfile.Request(
+                            method=interaction.request.method.upper(),
+                            url=interaction.request.uri,
+                            httpVersion=http_version,
+                            headers=[
+                                harfile.Record(name=name, value=values[0])
+                                for name, values in interaction.request.headers.items()
+                            ],
+                            queryString=[
+                                harfile.Record(name=name, value=value)
+                                for name, value in parse_qsl(query_params, keep_blank_values=True)
+                            ],
+                            cookies=_extract_cookies(interaction.request.headers.get("Cookie", [])),
+                            headersSize=_headers_size(interaction.request.headers),
+                            bodySize=interaction.request.body_size or 0,
+                            postData=post_data,
+                        ),
+                        response=response,
+                        timings=harfile.Timings(send=0, wait=0, receive=time, blocked=0, dns=0, connect=0, ssl=0),
+                    )
+            elif isinstance(item, Finalize):
+                break
+
+
+HARFILE_NO_RESPONSE = harfile.Response(
+    status=0,
+    httpVersion="",
+    statusText="",
+    headers=[],
+    cookies=[],
+    content=harfile.Content(),
+)
+
+
+def _headers_size(headers: dict[str, list[str]]) -> int:
+    size = 0
+    for name, values in headers.items():
+        # 4 is for ": " and "\r\n"
+        size += len(name) + 4 + len(values[0])
+    return size
+
+
+def _extract_cookies(headers: list[str]) -> list[harfile.Cookie]:
+    return [cookie for items in headers for item in items for cookie in _cookie_to_har(item)]
+
+
+def _cookie_to_har(cookie: str) -> Iterator[harfile.Cookie]:
+    parsed = SimpleCookie(cookie)
+    for name, data in parsed.items():
+        yield harfile.Cookie(
+            name=name,
+            value=data.value,
+            path=data["path"] or None,
+            domain=data["domain"] or None,
+            expires=data["expires"] or None,
+            httpOnly=data["httponly"] or None,
+            secure=data["secure"] or None,
+        )
+
+
 @dataclass
 class Replayed:
-    interaction: Dict[str, Any]
+    interaction: dict[str, Any]
     response: requests.Response
 
 
 def replay(
-    cassette: Dict[str, Any],
-    id_: Optional[str] = None,
-    status: Optional[str] = None,
-    uri: Optional[str] = None,
-    method: Optional[str] = None,
+    cassette: dict[str, Any],
+    id_: str | None = None,
+    status: str | None = None,
+    uri: str | None = None,
+    method: str | None = None,
     request_tls_verify: bool = True,
-    request_cert: Optional[RequestCert] = None,
+    request_cert: RequestCert | None = None,
+    request_proxy: str | None = None,
 ) -> Generator[Replayed, None, None]:
     """Replay saved interactions."""
+    import requests
+
     session = requests.Session()
     session.verify = request_tls_verify
     session.cert = request_cert
+    kwargs = {}
+    if request_proxy is not None:
+        kwargs["proxies"] = {"all": request_proxy}
     for interaction in filter_cassette(cassette["http_interactions"], id_, status, uri, method):
         request = get_prepared_request(interaction["request"])
-        response = session.send(request)  # type: ignore
+        response = session.send(request, **kwargs)  # type: ignore
         yield Replayed(interaction, response)
 
 
 def filter_cassette(
-    interactions: List[Dict[str, Any]],
-    id_: Optional[str] = None,
-    status: Optional[str] = None,
-    uri: Optional[str] = None,
-    method: Optional[str] = None,
-) -> Iterator[Dict[str, Any]]:
+    interactions: list[dict[str, Any]],
+    id_: str | None = None,
+    status: str | None = None,
+    uri: str | None = None,
+    method: str | None = None,
+) -> Iterator[dict[str, Any]]:
     filters = []
 
-    def id_filter(item: Dict[str, Any]) -> bool:
+    def id_filter(item: dict[str, Any]) -> bool:
         return item["id"] == id_
 
-    def status_filter(item: Dict[str, Any]) -> bool:
+    def status_filter(item: dict[str, Any]) -> bool:
         status_ = cast(str, status)
         return item["status"].upper() == status_.upper()
 
-    def uri_filter(item: Dict[str, Any]) -> bool:
+    def uri_filter(item: dict[str, Any]) -> bool:
         uri_ = cast(str, uri)
         return bool(re.search(uri_, item["request"]["uri"]))
 
-    def method_filter(item: Dict[str, Any]) -> bool:
+    def method_filter(item: dict[str, Any]) -> bool:
         method_ = cast(str, method)
         return bool(re.search(method_, item["request"]["method"]))
 
@@ -335,14 +529,18 @@ def filter_cassette(
     if method is not None:
         filters.append(method_filter)
 
-    def is_match(interaction: Dict[str, Any]) -> bool:
+    def is_match(interaction: dict[str, Any]) -> bool:
         return all(filter_(interaction) for filter_ in filters)
 
     return filter(is_match, interactions)
 
 
-def get_prepared_request(data: Dict[str, Any]) -> requests.PreparedRequest:
+def get_prepared_request(data: dict[str, Any]) -> requests.PreparedRequest:
     """Create a `requests.PreparedRequest` from a serialized one."""
+    import requests
+    from requests.cookies import RequestsCookieJar
+    from requests.structures import CaseInsensitiveDict
+
     prepared = requests.PreparedRequest()
     prepared.method = data["method"]
     prepared.url = data["uri"]

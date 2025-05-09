@@ -1,14 +1,17 @@
 """Schema mutations."""
+
+from __future__ import annotations
+
 import enum
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Callable, List, Optional, Sequence, Set, Tuple, TypeVar
+from typing import Any, Callable, Sequence, TypeVar
 
 from hypothesis import reject
 from hypothesis import strategies as st
 from hypothesis.strategies._internal.featureflags import FeatureStrategy
 
-from ....utils import fast_deepcopy
+from ....internal.copy import fast_deepcopy
 from ..utils import get_type, is_header_location
 from .types import Draw, Schema
 from .utils import can_negate
@@ -28,10 +31,10 @@ class MutationResult(enum.Enum):
     SUCCESS = 1
     FAILURE = 2
 
-    def __ior__(self, other: Any) -> "MutationResult":
+    def __ior__(self, other: Any) -> MutationResult:
         return self | other
 
-    def __or__(self, other: Any) -> "MutationResult":
+    def __or__(self, other: Any) -> MutationResult:
         # Syntactic sugar to simplify handling of multiple results
         if self == MutationResult.SUCCESS:
             return self
@@ -68,7 +71,7 @@ class MutationContext:
     # Schema location within API operation (header, query, etc)
     location: str
     # Payload media type, if available
-    media_type: Optional[str]
+    media_type: str | None
 
     @property
     def is_header_location(self) -> bool:
@@ -78,10 +81,14 @@ class MutationContext:
     def is_path_location(self) -> bool:
         return self.location == "path"
 
+    @property
+    def is_query_location(self) -> bool:
+        return self.location == "query"
+
     def mutate(self, draw: Draw) -> Schema:
         # On the top level, Schemathesis creates "object" schemas for all parameter "in" values except "body", which is
         # taken as-is. Therefore, we can only apply mutations that won't change the Open API semantics of the schema.
-        mutations: List[Mutation]
+        mutations: list[Mutation]
         if self.location in ("header", "cookie", "query"):
             # These objects follow this pattern:
             # {
@@ -172,7 +179,7 @@ def remove_required_property(context: MutationContext, draw: Draw, schema: Schem
     else:
         candidate = draw(st.sampled_from(sorted(required)))
         enabled_properties = draw(st.shared(FeatureStrategy(), key="properties"))  # type: ignore
-        candidates = [candidate] + sorted([prop for prop in required if enabled_properties.is_enabled(prop)])
+        candidates = [candidate, *sorted([prop for prop in required if enabled_properties.is_enabled(prop)])]
         property_name = draw(st.sampled_from(candidates))
     required.remove(property_name)
     if not required:
@@ -200,8 +207,11 @@ def change_type(context: MutationContext, draw: Draw, schema: Schema) -> Mutatio
     if context.media_type == "application/x-www-form-urlencoded":
         # Form data should be an object, do not change it
         return MutationResult.FAILURE
-    # Headers are always strings, can't negate this
-    if context.is_header_location:
+    # For headers, query and path parameters, if the current type is string, then it already
+    # includes all possible values as those parameters will be stringified before sending,
+    # therefore it can't be negated.
+    types = get_type(schema)
+    if "string" in types and (context.is_header_location or context.is_path_location or context.is_query_location):
         return MutationResult.FAILURE
     candidates = _get_type_candidates(context, schema)
     if not candidates:
@@ -216,16 +226,17 @@ def change_type(context: MutationContext, draw: Draw, schema: Schema) -> Mutatio
     candidate = draw(st.sampled_from(sorted(candidates)))
     candidates.remove(candidate)
     enabled_types = draw(st.shared(FeatureStrategy(), key="types"))  # type: ignore
-    remaining_candidates = [candidate] + sorted(
-        [candidate for candidate in candidates if enabled_types.is_enabled(candidate)]
-    )
+    remaining_candidates = [
+        candidate,
+        *sorted([candidate for candidate in candidates if enabled_types.is_enabled(candidate)]),
+    ]
     new_type = draw(st.sampled_from(remaining_candidates))
     schema["type"] = new_type
     prevent_unsatisfiable_schema(schema, new_type)
     return MutationResult.SUCCESS
 
 
-def _get_type_candidates(context: MutationContext, schema: Schema) -> Set[str]:
+def _get_type_candidates(context: MutationContext, schema: Schema) -> set[str]:
     types = set(get_type(schema))
     if context.is_path_location:
         candidates = {"string", "integer", "number", "boolean", "null"} - types
@@ -334,7 +345,7 @@ def _change_items_object(context: MutationContext, draw: Draw, schema: Schema, i
     return MutationResult.SUCCESS
 
 
-def _change_items_array(context: MutationContext, draw: Draw, schema: Schema, items: List) -> MutationResult:
+def _change_items_array(context: MutationContext, draw: Draw, schema: Schema, items: list) -> MutationResult:
     latest_success_index = None
     for idx, item in enumerate(items):
         result = MutationResult.FAILURE
@@ -361,6 +372,11 @@ def negate_constraints(context: MutationContext, draw: Draw, schema: Schema) -> 
         # Should we negate this key?
         if k == "required":
             return v != []
+        if k in ("example", "examples"):
+            return False
+        if context.is_path_location and k == "minLength" and v == 1:
+            # Empty path parameter will be filtered out
+            return False
         return not (
             k in ("type", "properties", "items", "minItems")
             or (k == "additionalProperties" and context.is_header_location)
@@ -397,12 +413,12 @@ def negate_constraints(context: MutationContext, draw: Draw, schema: Schema) -> 
 DEPENDENCIES = {"exclusiveMaximum": "maximum", "exclusiveMinimum": "minimum"}
 
 
-def get_mutations(draw: Draw, schema: Schema) -> Tuple[Mutation, ...]:
+def get_mutations(draw: Draw, schema: Schema) -> tuple[Mutation, ...]:
     """Get mutations possible for a schema."""
     types = get_type(schema)
     # On the top-level of Open API schemas, types are always strings, but inside "schema" objects, they are the same as
     # in JSON Schema, where it could be either a string or an array of strings.
-    options: List[Mutation] = [negate_constraints, change_type]
+    options: list[Mutation] = [negate_constraints, change_type]
     if "object" in types:
         options.extend([change_properties, remove_required_property])
     elif "array" in types:
@@ -414,7 +430,7 @@ def ident(x: T) -> T:
     return x
 
 
-def ordered(items: Sequence[T], unique_by: Callable[[T], Any] = ident) -> st.SearchStrategy[List[T]]:
+def ordered(items: Sequence[T], unique_by: Callable[[T], Any] = ident) -> st.SearchStrategy[list[T]]:
     """Returns a strategy that generates randomly ordered lists of T.
 
     NOTE. Items should be unique.
