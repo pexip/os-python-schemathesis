@@ -1,34 +1,26 @@
 --- a/test/cli/test_commands.py
 +++ b/test/cli/test_commands.py
-@@ -63,6 +63,7 @@
-     assert result.stdout == result_h.stdout == result_help.stdout
+@@ -58,6 +58,7 @@
+     assert cli.main() == snapshot_cli
  
  
 +@pytest.mark.skip("Entrypoint not installed")
  def test_run_subprocess(testdir):
      # To verify that CLI entry point is installed properly
      result = testdir.run("schemathesis")
-@@ -569,6 +570,7 @@
-     assert not warnings
- 
- 
-+@pytest.mark.skip("Entrypoint not installed")
- @pytest.mark.openapi_version("3.0")
- @pytest.mark.operations("failure")
- def test_hypothesis_do_not_print_blob(testdir, monkeypatch, cli, schema_url):
-@@ -1856,6 +1858,7 @@
+@@ -1940,6 +1941,7 @@
      assert result.exit_code == ExitCode.OK, result.stdout
  
  
 +@pytest.mark.skip("Entrypoint not installed")
- def test_long_operation_output(testdir, empty_open_api_3_schema):
+ def test_long_operation_output(ctx, cli):
      # See GH-990
      # When there is a narrow screen
-@@ -1880,6 +1883,7 @@
-     assert "GET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa[...] . [100%]" in result.outlines
+@@ -1965,6 +1967,7 @@
+     assert "GET /aaaaaaaaaa .                                                         [100%]" in result.stdout
  
  
 +@pytest.mark.skip("Entrypoint not installed")
- def test_reserved_characters_in_operation_name(testdir, empty_open_api_3_schema):
+ def test_reserved_characters_in_operation_name(ctx, cli):
      # See GH-992
      # When an API operation name contains `:`
