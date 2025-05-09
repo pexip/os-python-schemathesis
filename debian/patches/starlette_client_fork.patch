@@ -1,16 +1,12 @@
-Index: os-python-schemathesis/src/schemathesis/starlette_testclient/__init__.py
-===================================================================
 --- /dev/null
-+++ os-python-schemathesis/src/schemathesis/starlette_testclient/__init__.py
++++ b/src/schemathesis/starlette_testclient/__init__.py
 @@ -0,0 +1,3 @@
 +from schemathesis.starlette_testclient._testclient import TestClient
 +
 +__all__ = ["TestClient"]
-Index: os-python-schemathesis/src/schemathesis/starlette_testclient/_testclient.py
-===================================================================
 --- /dev/null
-+++ os-python-schemathesis/src/schemathesis/starlette_testclient/_testclient.py
-@@ -0,0 +1,581 @@
++++ b/src/schemathesis/starlette_testclient/_testclient.py
+@@ -0,0 +1,585 @@
 +import contextlib
 +import http
 +import inspect
@@ -37,6 +33,10 @@ Index: os-python-schemathesis/src/schemathesis/starlette_testclient/_testclient.
 +else:  # pragma: no cover
 +    from typing_extensions import TypedDict
 +
++try:
++    start_blocking_portal = anyio.from_thread.start_blocking_portal
++except AttributeError:  # pragma: no cover
++    start_blocking_portal = anyio.start_blocking_portal
 +
 +_PortalFactoryType = typing.Callable[
 +    [], typing.ContextManager[anyio.abc.BlockingPortal]
@@ -460,7 +460,7 @@ Index: os-python-schemathesis/src/schemathesis/starlette_testclient/_testclient.
 +        if self.portal is not None:
 +            yield self.portal
 +        else:
-+            with anyio.start_blocking_portal(**self.async_backend) as portal:
++            with start_blocking_portal(**self.async_backend) as portal:
 +                yield portal
 +
 +    def request(  # type: ignore
@@ -525,7 +525,7 @@ Index: os-python-schemathesis/src/schemathesis/starlette_testclient/_testclient.
 +    def __enter__(self) -> "TestClient":
 +        with contextlib.ExitStack() as stack:
 +            self.portal = portal = stack.enter_context(
-+                anyio.start_blocking_portal(**self.async_backend)
++                start_blocking_portal(**self.async_backend)
 +            )
 +
 +            @stack.callback
@@ -553,7 +553,7 @@ Index: os-python-schemathesis/src/schemathesis/starlette_testclient/_testclient.
 +        self.exit_stack.close()
 +
 +    async def lifespan(self) -> None:
-+        scope = {"type": "lifespan"}
++        scope = {"type": "lifespan", "asgi": {"version": "3.0"}}
 +        try:
 +            await self.app(scope, self.stream_receive.receive, self.stream_send.send)
 +        finally:
@@ -592,49 +592,58 @@ Index: os-python-schemathesis/src/schemathesis/starlette_testclient/_testclient.
 +            )
 +            if message["type"] == "lifespan.shutdown.failed":
 +                await receive()
-Index: os-python-schemathesis/src/schemathesis/models.py
-===================================================================
---- os-python-schemathesis.orig/src/schemathesis/models.py
-+++ os-python-schemathesis/src/schemathesis/models.py
-@@ -34,7 +34,7 @@ import werkzeug
- from hypothesis import event, note, reject
- from hypothesis import strategies as st
- from requests.structures import CaseInsensitiveDict
--from starlette_testclient import TestClient as ASGIClient
-+from schemathesis.starlette_testclient import TestClient as ASGIClient
+diff --git a/src/schemathesis/specs/graphql/loaders.py b/src/schemathesis/specs/graphql/loaders.py
+index 9d343b9..0f578d7 100644
+--- a/src/schemathesis/specs/graphql/loaders.py
++++ b/src/schemathesis/specs/graphql/loaders.py
+@@ -334,7 +334,7 @@ def from_asgi(
+     :param app: An ASGI app instance.
+     :param Optional[str] base_url: Base URL to send requests to.
+     """
+-    from starlette_testclient import TestClient as ASGIClient
++    from schemathesis.starlette_testclient import TestClient as ASGIClient
  
- from . import failures, serializers
- from .auths import AuthStorage
-Index: os-python-schemathesis/src/schemathesis/specs/graphql/loaders.py
-===================================================================
---- os-python-schemathesis.orig/src/schemathesis/specs/graphql/loaders.py
-+++ os-python-schemathesis/src/schemathesis/specs/graphql/loaders.py
-@@ -7,7 +7,7 @@ import requests
- from graphql import ExecutionResult
- from pyrate_limiter import Limiter
- from starlette.applications import Starlette
--from starlette_testclient import TestClient as ASGIClient
-+from schemathesis.starlette_testclient import TestClient as ASGIClient
- from werkzeug import Client
- from yarl import URL
+     require_relative_url(schema_path)
+     setup_default_headers(kwargs)
+diff --git a/src/schemathesis/specs/openapi/loaders.py b/src/schemathesis/specs/openapi/loaders.py
+index 6a0c3ac..7bd8da8 100644
+--- a/src/schemathesis/specs/openapi/loaders.py
++++ b/src/schemathesis/specs/openapi/loaders.py
+@@ -679,7 +679,7 @@ def from_asgi(
+     :param str schema_path: An in-app relative URL to the schema.
+     :param app: An ASGI app instance.
+     """
+-    from starlette_testclient import TestClient as ASGIClient
++    from schemathesis.starlette_testclient import TestClient as ASGIClient
  
-Index: os-python-schemathesis/src/schemathesis/specs/openapi/loaders.py
-===================================================================
---- os-python-schemathesis.orig/src/schemathesis/specs/openapi/loaders.py
-+++ os-python-schemathesis/src/schemathesis/specs/openapi/loaders.py
-@@ -11,7 +11,7 @@ import yaml
- from jsonschema import ValidationError
- from pyrate_limiter import Limiter
- from starlette.applications import Starlette
--from starlette_testclient import TestClient as ASGIClient
-+from schemathesis.starlette_testclient import TestClient as ASGIClient
- from werkzeug.test import Client
- from yarl import URL
+     require_relative_url(schema_path)
+     setup_default_headers(kwargs)
+diff --git a/src/schemathesis/transports/__init__.py b/src/schemathesis/transports/__init__.py
+index 2a664d3..6838401 100644
+--- a/src/schemathesis/transports/__init__.py
++++ b/src/schemathesis/transports/__init__.py
+@@ -22,7 +22,7 @@ if TYPE_CHECKING:
+     import requests
+     import werkzeug
+     from _typeshed.wsgi import WSGIApplication
+-    from starlette_testclient._testclient import ASGI2App, ASGI3App
++    from schemathesis.starlette_testclient._testclient import ASGI2App, ASGI3App
  
-Index: os-python-schemathesis/test/auth/test_pytest.py
-===================================================================
---- os-python-schemathesis.orig/test/auth/test_pytest.py
-+++ os-python-schemathesis/test/auth/test_pytest.py
+     from ..models import Case
+     from .responses import WSGIResponse
+@@ -262,7 +262,7 @@ class ASGITransport(RequestsTransport):
+         cookies: dict[str, Any] | None = None,
+         **kwargs: Any,
+     ) -> requests.Response:
+-        from starlette_testclient import TestClient as ASGIClient
++        from schemathesis.starlette_testclient import TestClient as ASGIClient
+ 
+         if base_url is None:
+             base_url = case.get_full_base_url()
+diff --git a/test/auth/test_pytest.py b/test/auth/test_pytest.py
+index bf96eb7..77be121 100644
+--- a/test/auth/test_pytest.py
++++ b/test/auth/test_pytest.py
 @@ -100,7 +100,7 @@ class Auth:
  """
      if python_app_type == "asgi":
@@ -644,3 +653,16 @@ Index: os-python-schemathesis/test/auth/test_pytest.py
  
  @schema.auth()
  class Auth:
+diff --git a/test/specs/openapi/test_ignored_auth.py b/test/specs/openapi/test_ignored_auth.py
+index dcb65a2..ad2fbde 100644
+--- a/test/specs/openapi/test_ignored_auth.py
++++ b/test/specs/openapi/test_ignored_auth.py
+@@ -8,7 +8,7 @@ import requests
+ from fastapi import FastAPI, HTTPException, Security, status
+ from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials
+ from hypothesis import Phase, given, settings
+-from starlette_testclient import TestClient
++from schemathesis.starlette_testclient import TestClient
+ 
+ import schemathesis
+ from schemathesis.exceptions import CheckFailed
