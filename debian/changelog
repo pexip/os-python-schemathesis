@@ -1,3 +1,9 @@
+python-schemathesis (3.39.16-0+pexip25u1) pexip-trixie; urgency=medium
+
+  * New upstream release
+
+ -- Huw Jones <huw@pexip.com>  Fri, 09 May 2025 14:47:40 +0100
+
 python-schemathesis (3.19.7-0+pexip25u1) pexip-trixie; urgency=medium
 
   * Initial trixie build
