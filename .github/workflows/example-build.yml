@@ -23,7 +23,7 @@ jobs:
         working-directory: "./example"
 
       # Runs positive Schemathesis tests
-      - uses: schemathesis/action@v1
+      - uses: schemathesis/action@v3
         continue-on-error: true
         with:
           # A local API schema location

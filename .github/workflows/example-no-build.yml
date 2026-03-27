@@ -9,7 +9,7 @@ jobs:
 
     steps:
       # Runs positive Schemathesis tests
-      - uses: schemathesis/action@v1
+      - uses: schemathesis/action@v3
         with:
           # A publicly available API schema location
           schema: "https://example.schemathesis.io/openapi.json"
