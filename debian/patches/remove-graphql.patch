@@ -1,3 +1,5 @@
+Remove graphql dependency as we do not use it
+
 diff --git a/pyproject.toml b/pyproject.toml
 index c0e5267..9609ecc 100644
 --- a/pyproject.toml

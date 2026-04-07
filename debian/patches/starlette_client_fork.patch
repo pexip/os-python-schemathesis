@@ -1,3 +1,6 @@
+Use local copy of the starlette test client as it is only used at test time and
+we don't want to package it just for that
+
 --- /dev/null
 +++ b/src/schemathesis/starlette_testclient/__init__.py
 @@ -0,0 +1,3 @@

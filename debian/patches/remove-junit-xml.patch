@@ -1,3 +1,5 @@
+Remove junit-xml dependency as we do not use it
+
 diff --git a/pyproject.toml b/pyproject.toml
 index c0e5267..b211ecd 100644
 --- a/pyproject.toml

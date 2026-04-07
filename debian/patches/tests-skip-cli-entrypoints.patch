@@ -1,3 +1,5 @@
+Skip tests which are not applicable to our environment
+
 --- a/test/cli/test_commands.py
 +++ b/test/cli/test_commands.py
 @@ -58,12 +58,14 @@
